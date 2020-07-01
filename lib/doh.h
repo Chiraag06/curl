@@ -56,7 +56,8 @@ typedef enum {
   DOH_DNS_UNEXPECTED_CLASS, /* 10 */
   DOH_NO_CONTENT,           /* 11 */
   DOH_DNS_BAD_ID,           /* 12 */
-  DOH_DNS_NAME_TOO_LONG     /* 13 */
+  DOH_DNS_NAME_TOO_LONG,    /* 13 */
+  DOH_PORT_OUT_OF_RANGE     /* 14 */
 } DOHcode;
 
 typedef enum {
@@ -65,14 +66,21 @@ typedef enum {
   DNS_TYPE_CNAME = 5,
   DNS_TYPE_TXT = 16,
   DNS_TYPE_AAAA = 28,
-  DNS_TYPE_DNAME = 39           /* RFC6672 */
+  DNS_TYPE_DNAME = 39,          /* RFC6672 */
+  /* TODO ********************************************************** *
+   * replace temporary code-points with assigned ones when available *
+   * *************************************************************** */
+  DNS_TYPE_SVCB = 65481,
+  DNS_TYPE_HTTPS = 65482
 } DNStype;
 
 #define DOH_MAX_ADDR 24
-#define DOH_MAX_CNAME 4
+#define DOH_MAX_CNAME 8
 #define DOH_MAX_ESNI_TXT 4
+#define DOH_MAX_SVCB_DATA 4
 
 struct cnamestore {
+  /* TODO: establish whether this is used for anything */
   size_t len;       /* length of cname */
   char *alloc;      /* allocated pointer */
   size_t allocsize; /* allocated size */
@@ -101,6 +109,9 @@ struct dohentry {
   struct cnamestore cname[DOH_MAX_CNAME];
   int num_esni_txt;
   struct txtstore esni_txt[DOH_MAX_ESNI_TXT];
+  int num_svcb_data;
+  struct txtstore               /* TODO: dedicated structure ? */
+  svcb_data[DOH_MAX_SVCB_DATA];
 };
 
 

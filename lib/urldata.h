@@ -550,6 +550,7 @@ enum doh_slots {
 
 #ifdef USE_ESNI
   DOH_PROBE_SLOT_ESNI_TXT,      /* ESNI draft 02 uses (TXT, "_esni") */
+  DOH_PROBE_SLOT_BIND_SVC,      /* ESNI draft 07 uses HTTPS or SVCB */
 #endif
 
   /* AFTER all slot definitions, establish how many we have */

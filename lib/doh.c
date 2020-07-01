@@ -404,12 +404,13 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
                         int *waitp)
 {
   struct Curl_easy *data = conn->data;
-  CURLcode result = CURLE_OK;
   int slot;
+  uint16_t qtype;
+  char *scheme;
+  char *prefix = NULL;
+  CURLcode result = CURLE_OK;
+
   *waitp = TRUE; /* this never returns synchronously */
-  (void)conn;
-  (void)hostname;
-  (void)port;
 
   /* start clean, consider allocating this struct on demand */
   memset(&data->req.doh, 0, sizeof(struct dohdata));
@@ -421,6 +422,78 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
                       "Content-Type: application/dns-message");
   if(!data->req.doh.headers)
     goto error;
+
+#ifdef USE_ESNI
+  /* Work out (here or earlier) which DNS probes we should send:
+   * - TXT with _esni prefix: always, while we support ESNI draft 02
+   * - HTTPS without prefix
+   * - HTTPS with _PORT prefix
+   * - SVCB with _PORT._SCHEME prefix
+   */
+
+  scheme = data->state.up.scheme;
+  infof(data, "Preparing DNS probe for service binding\n");
+  infof(data, "  hostname: %s\n", hostname);
+  infof(data, "  port:     %d\n", port);
+  infof(data, "  scheme:   %s\n", scheme);
+
+  if((!strcmp(scheme, "https")) || (!strcmp(scheme, "http"))) {
+    size_t pflen = 6 + 1;
+    qtype = DNS_TYPE_HTTPS;
+    if((port < 1) || (port > 65534)) {
+      result = DOH_PORT_OUT_OF_RANGE;
+      goto error;
+    }
+    if((port != 80) && (port != 443)) {
+      /* Construct ATTRLEAF prefix _PORT */
+      prefix = calloc(1, pflen + 1);
+      if((!prefix) ||
+         (!curl_msnprintf(prefix, 6, "_%d", port))) {
+        result = DOH_OUT_OF_MEM;
+        goto error;
+      }
+    }
+  }
+
+  else {
+    size_t pflen = 6 + 1 + strlen(scheme) + 1;
+    qtype = DNS_TYPE_SVCB;
+    prefix = calloc(1, pflen + 1);
+    if((!prefix) ||
+        (!curl_msnprintf(prefix, pflen, "_%d._%s", port, scheme))) {
+        result = DOH_OUT_OF_MEM;
+        goto error;
+      }
+  }
+
+  infof(data, "  prefix:   %s\n", prefix);
+  infof(data, "  qtype:    %d\n", qtype);
+  infof(data, "  TODO: probe for service binding is not yet implemented\n");
+
+  /* Probe for ESNI_TXT and/or SVCB/HTTPS before probing for A/AAAA */
+  if((data->set.tls_enable_esni) /* ESNI was requested */
+     /* TODO: skip if we have the material already in cache */
+     ) {
+    /* create service binding request (for ESNI draft-07) */
+    result = dohprobe(data,
+                   &data->req.doh.probe[DOH_PROBE_SLOT_BIND_SVC],
+                      qtype, prefix, /* each as computed */
+                      hostname, data->set.str[STRING_DOH],
+                      data->multi, data->req.doh.headers);
+    if(result)
+      goto error;
+    data->req.doh.pending++;
+
+    /* create ESNI TXT request (for ESNI draft-02) */
+    result = dohprobe(data, &data->req.doh.probe[DOH_PROBE_SLOT_ESNI_TXT],
+                      DNS_TYPE_TXT, "_esni",
+                      hostname, data->set.str[STRING_DOH],
+                      data->multi, data->req.doh.headers);
+    if(result)
+      goto error;
+    data->req.doh.pending++;
+  }
+#endif
 
   if(conn->ip_version != CURL_IPRESOLVE_V6) {
     /* create IPv4 DOH request */
@@ -443,25 +516,6 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
       goto error;
     data->req.doh.pending++;
   }
-
-#ifdef USE_ESNI
-  if((data->set.tls_enable_esni) /* ESNI was requested */
-     /* TODO: skip if we have the material already */
-     /* FOR NOW: since we don't process the result yet,
-        it would be nice to see what's going on ... */
-     /* && */
-     /* (!data->set.str[STRING_ESNI_ASCIIRR]) */
-     ) {
-    /* create ESNI TXT request */
-    result = dohprobe(data, &data->req.doh.probe[DOH_PROBE_SLOT_ESNI_TXT],
-                      DNS_TYPE_TXT, "_esni",
-                      hostname, data->set.str[STRING_DOH],
-                      data->multi, data->req.doh.headers);
-    if(result)
-      goto error;
-    data->req.doh.pending++;
-  }
-#endif
 
   return NULL;
 
@@ -670,6 +724,35 @@ static DOHcode store_esni_txt(unsigned char *doh,
   return DOH_OK;
 }
 
+static DOHcode store_svcb_rdata(unsigned char *doh,
+                              size_t dohlen,
+                              unsigned int index,
+                              unsigned short rdlength,
+                              struct dohentry *d)
+{
+  struct txtstore *c;
+  size_t rdlen;
+  unsigned char *src;
+
+  rdlen = rdlength;
+  src = doh + index;
+
+  if(rdlen > dohlen - index)
+    return DOH_DNS_OUT_OF_RANGE;
+
+  c = &d->svcb_data[d->num_svcb_data++];
+  c->allocsize = rdlen;
+  c->alloc = calloc(1, c->allocsize);
+
+  if(!c->alloc)
+    return DOH_OUT_OF_MEM;
+
+  memcpy(c->alloc, src, rdlen);
+  c->len = rdlen;
+
+  return DOH_OK;
+}
+
 static DOHcode rdata(unsigned char *doh,
                      size_t dohlen,
                      unsigned short rdlength,
@@ -682,6 +765,9 @@ static DOHcode rdata(unsigned char *doh,
      - AAAA (TYPE 28): 16 bytes
      - NS (TYPE 2): N bytes */
   DOHcode rc;
+  /* uint16_t sf_priority; */
+  /* unsigned char *sf_domain_name; */
+  /* void *sf_value; */
 
   switch(type) {
   case DNS_TYPE_A:
@@ -710,6 +796,12 @@ static DOHcode rdata(unsigned char *doh,
       if(rc)
         return rc;
     }
+    break;
+  case DNS_TYPE_SVCB:
+  case DNS_TYPE_HTTPS:
+    rc = store_svcb_rdata(doh, dohlen, index, rdlength, d);
+    if(rc)
+      return rc;
     break;
   case DNS_TYPE_DNAME:
     /* explicit for clarity; just skip; rely on synthesized CNAME  */
@@ -910,6 +1002,65 @@ static char *bin2hex(char *dst, size_t *dstlen,
 }
 #endif
 
+static int *wire2name(char *dst, size_t dstlen,
+                      unsigned char *src, size_t srclen)
+{
+  int i;
+  int count = 0;             /* successfully processed source bytes */
+  int cursor = 0;            /* current offset in source buffer     */
+  char *p = dst;             /* position in destination buffer      */
+
+  if(dst) {
+    while(*src) {
+      /* Process each non-empty label */
+      if((2 + *src) > srclen) {
+        /* ERROR: label overflows buffer */
+        count = -1;              /* treat malformed source as unprocessed */
+        break;
+      }
+      else if((1 + *src) > dstlen) {
+        /* ERROR: not enough room in destination for label */
+        count = -2;
+        break;
+      }
+      else {
+        /* Copy a non-empty label */
+        cursor = 1;       /* allow for count byte */
+        for(i = src[0]; i > 0; i--) {
+          *p++ = src[cursor++];
+          dstlen--;
+        }
+        src += cursor;          /* advance over processed data */
+        srclen -= cursor;       /* adjust residual count */
+        count += cursor;        /* adjust processed count */
+        if(*src) {
+          *p++ = '.';   /* separator before following label */
+          dstlen--;
+        }
+      }
+    } /* Next non-empty label */
+
+    if((srclen) && (!*src)) {
+      /* Final empty label, as expected */
+
+      if(dstlen > (count ? 0 : 1)) {
+        /* There's enough space  */
+        if(!count) {
+          *p++ = '.';           /* display a dot if name is empty */
+        }
+        *p = NULL;
+        count++;                /* count past the trailing empty label */
+      }
+      else
+        count = -3;
+    }
+    else                        /* Something is wrong */
+      count = -4;
+  }
+  return count;                 /* count of processed source bytes
+                                   or zero or negative for error */
+}
+
 static void showdoh(struct Curl_easy *data,
                     struct dohentry *d)
 {
@@ -953,6 +1104,96 @@ static void showdoh(struct Curl_easy *data,
     infof(data, "CNAME: %s\n", d->cname[i].alloc);
   }
 #ifdef USE_ESNI
+  for(i = 0; i < d->num_svcb_data; i++) {
+    unsigned char *buffer = d->svcb_data[i].alloc;
+    size_t buflen = d->svcb_data[i].len;
+    uint16_t priority;
+    int count;
+    bool error = NULL;
+
+    /* TODO: work out what libcurl utility finction does this */
+    display = bin2hex(display, &displen,
+                      buffer, buflen,
+                      truncate);
+
+    if(display) {
+      repr = strlen(display) / 2;
+      tail = (char *) ((repr < buflen) ? "..." : "");
+      infof(data, "DOH svcbdata: (%3d/%-3d) %s%s\n",
+            repr, buflen, display, tail);
+
+      if(buflen >= 2) {
+        /* Priority (SvcRecordType) */
+        priority = (((255 & buffer[0])<<8) | (255 & buffer[1]));
+        buffer += 2;
+        buflen -= 2;
+        infof(data, "    Priority: %d (%s)\n",
+              priority,
+              (priority ? "ServiceForm" : "AliasForm"));
+
+        /* SvcDomainName */
+        count = wire2name(display, displen, buffer, buflen);
+        if(count > 0) {
+          infof(data, "    SvcDomaimName: '%s'\n", display);
+          buffer += count;
+          buflen -= count;
+        }
+        else {
+          infof(data, "    SvcDomainName: invalid (error code: %d)\n", count);
+          break;
+        }
+
+        if(priority) {
+          /* ServiceForm -- expect:                        */
+          /* - ScvDomainName -- may be just an empty label */
+          /* - one (zero?) or more SvcFieldValues          */
+          if(!buflen) {
+            infof(data, "    no SvcFieldValue found\n");
+          }
+          else {
+            while(buflen && !error) {
+              uint16_t have_key = 0;
+              uint16_t key;
+              uint16_t paramlen;
+              if(buflen < 4) {
+                /* Need at least key and length, each two bytes long */
+                infof(data, "    invalid SvcFieldValue: too short\n");
+              }
+              else {
+                key  = (((255 & buffer[0])<<8) | (255 & buffer[1]));
+                buffer += 2;
+                buflen -= 2;
+                infof(data, "    SvcParamKey: %d\n", key);
+                if(key <= have_key) {
+                  infof(data, "    invalid SvcParamKey: out of order\n");
+                  error = TRUE;
+                }
+                else {
+                  paramlen  = (((255 & buffer[0])<<8) | (255 & buffer[1]));
+                  buffer += 2;
+                  buflen -= 2;
+                  if(paramlen > buflen) {
+                    infof(data, "    invalid parameter length: too big\n");
+                    error = TRUE;
+                  }
+                  infof(data, "    SvcParamVal: (%d) (TBD)\n", paramlen);
+                  buffer += paramlen;
+                  buflen -= paramlen;
+                }
+                have_key = key;
+              }
+            } /* Next SvcFieldValue */
+          }
+        }
+        else {
+          /* AliasForm -- expect buffer already exhausted  */
+          if(buflen) {
+            infof(data, "    unexpected residual data after SvcDomNm\n");
+          }
+        }
+      }
+    }
+  }
   for(i = 0; i < d->num_esni_txt; i++) {
     CURLcode rc;
     size_t declen;
@@ -1192,9 +1433,11 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
       de.prefix = prefix;       /* ? UGLY hack: need context for decoding */
       infof(data,
             (prefix ?
-             "DOH: slot %d, prefix '%s', buffer size %d\n" :
-             "DOH: slot %d, prefix %p, buffer size %d\n"),
-            slot, prefix,
+             "DOH: slot %d, qtype %d, prefix '%s', buffer size %d\n" :
+             "DOH: slot %d, qtype %d, prefix %p, buffer size %d\n"),
+            slot,
+            data->req.doh.probe[slot].dnstype,
+            prefix,
             data->req.doh.probe[slot].serverdoh.size);
       rc[slot] = doh_decode(data->req.doh.probe[slot].serverdoh.memory,
                             data->req.doh.probe[slot].serverdoh.size,
