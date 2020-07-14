@@ -405,10 +405,14 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
 {
   struct Curl_easy *data = conn->data;
   int slot;
-  uint16_t qtype;
-  char *scheme;
   char *prefix = NULL;
   CURLcode result = CURLE_OK;
+
+#ifdef USE_ESNI
+  int qport;
+  char *scheme;
+  uint16_t qtype;
+#endif
 
   *waitp = TRUE; /* this never returns synchronously */
 
@@ -424,28 +428,39 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
     goto error;
 
 #ifdef USE_ESNI
-  /* Work out (here or earlier) which DNS probes we should send:
+  qport = port;
+  scheme = data->state.up.scheme;
+
+  infof(data, "Preparing DNS probe for service binding\n");
+  infof(data, "  scheme:   %s\n", scheme);
+  infof(data, "  hostname: %s\n", hostname);
+  infof(data, "  port:     %d\n", port);
+
+  /* Work out which DNS probes we should send:
    * - TXT with _esni prefix: always, while we support ESNI draft 02
-   * - HTTPS without prefix
-   * - HTTPS with _PORT prefix
+   * - HTTPS without prefix, or
+   * - HTTPS with _PORT prefix, or
    * - SVCB with _PORT._SCHEME prefix
    */
 
-  scheme = data->state.up.scheme;
-  infof(data, "Preparing DNS probe for service binding\n");
-  infof(data, "  hostname: %s\n", hostname);
-  infof(data, "  port:     %d\n", port);
-  infof(data, "  scheme:   %s\n", scheme);
+  if(!strcmp(scheme, "http")) {
+    /* Construct (components of) "https" URL according to */
+    /* section 7.5 of draft-ietf-dnsop-svcb-https-01      */
+    if(qport == 80)
+      qport = 443;
+    scheme = (char *) "https";
+    }
 
-  if((!strcmp(scheme, "https")) || (!strcmp(scheme, "http"))) {
+  if(!strcmp(scheme, "https")) {
+    /* Original or constructed scheme is "https" -- use QTYPE HTTPS */
     size_t pflen = 6 + 1;
     qtype = DNS_TYPE_HTTPS;
     if((port < 1) || (port > 65534)) {
       result = DOH_PORT_OUT_OF_RANGE;
       goto error;
     }
-    if((port != 80) && (port != 443)) {
-      /* Construct ATTRLEAF prefix _PORT */
+    if(port != 443) {
+      /* Non-default port in use -- construct ATTRLEAF prefix _PORT */
       prefix = calloc(1, pflen + 1);
       if((!prefix) ||
          (!curl_msnprintf(prefix, 6, "_%d", port))) {
@@ -456,6 +471,7 @@ Curl_addrinfo *Curl_doh(struct connectdata *conn,
   }
 
   else {
+    /* No appropriate SVCB-compatible RR type -- use QTYPE SVCB */
     size_t pflen = 6 + 1 + strlen(scheme) + 1;
     qtype = DNS_TYPE_SVCB;
     prefix = calloc(1, pflen + 1);
@@ -1002,23 +1018,23 @@ static char *bin2hex(char *dst, size_t *dstlen,
 }
 #endif
 
-static int *wire2name(char *dst, size_t dstlen,
+static size_t wire2name(char *dst, size_t dstlen,
                       unsigned char *src, size_t srclen)
 {
   int i;
-  int count = 0;             /* successfully processed source bytes */
-  int cursor = 0;            /* current offset in source buffer     */
+  size_t count = 0;          /* successfully processed source bytes */
+  size_t cursor = 0;         /* current offset in source buffer     */
   char *p = dst;             /* position in destination buffer      */
 
   if(dst) {
     while(*src) {
       /* Process each non-empty label */
-      if((2 + *src) > srclen) {
+      if((*src + 2U) > srclen) {
         /* ERROR: label overflows buffer */
         count = -1;              /* treat malformed source as unprocessed */
         break;
       }
-      else if((1 + *src) > dstlen) {
+      else if((*src + 1U) > dstlen) {
         /* ERROR: not enough room in destination for label */
         count = -2;
         break;
@@ -1048,7 +1064,7 @@ static int *wire2name(char *dst, size_t dstlen,
         if(!count) {
           *p++ = '.';           /* display a dot if name is empty */
         }
-        *p = NULL;
+        *p = '\0';
         count++;                /* count past the trailing empty label */
       }
       else
@@ -1061,12 +1077,511 @@ static int *wire2name(char *dst, size_t dstlen,
                                    or zero or negative for error */
 }
 
+static size_t display_public_name(struct Curl_easy *data,
+                                        unsigned char *buffer, size_t more)
+{
+  size_t progress;
+  uint16_t len = get16bit(buffer, 0);
+  if(len > (more - 2)) {
+    progress = more;            /* mark rest of buffer done */
+  }
+  else {
+    char *display = calloc(1, len + 1);
+    buffer += 2;
+    if(display) {
+      memcpy(display, buffer, len);
+      infof(data, "        - public_name (%d): '%s'\n", len, display);
+      free(display);
+    }
+    progress = 2 + len;
+  }
+  return progress;
+}
+
+static size_t display_cipher_suites(struct Curl_easy *data,
+                                          unsigned char *buffer, size_t more)
+{
+  size_t progress;
+  uint16_t len = get16bit(buffer, 0);
+  if(len > (more - 2)) {
+    progress = more;            /* mark rest of buffer done */
+  }
+  else {
+    int i;
+    buffer += 2;
+    progress = 2;
+    for(i = 0; i < len; i += 4) {
+      unsigned int kdf_id, aead_id;
+      kdf_id = get16bit(buffer, 0);
+      aead_id = get16bit(buffer, 2);
+      buffer += 4;
+      progress += 4;
+      if(!i) {
+        infof(data, "        - cipher_suites (%d): 0x%04X 0x%04X\n",
+              len, kdf_id, aead_id);
+      }
+      else {
+        infof(data, "                            0x%04X 0x%04X\n",
+              kdf_id, aead_id);
+      }
+    }
+  }
+  return progress;
+}
+
+static size_t display_extensions(struct Curl_easy *data,
+                                       unsigned char *buffer, size_t more)
+{
+  size_t progress;
+  uint16_t len = get16bit(buffer, 0);
+  if(len > (more - 2)) {
+    progress = more;            /* mark rest of buffer done */
+  }
+  else if(!len) {
+    progress = 2;
+    infof(data, "        - extensions (0)\n");
+  }
+  else {
+    size_t limit = 2 * len;
+    char *display = calloc(1, limit + 1);
+    buffer += 2;
+    if(display) {
+      int i;
+      char *ptr = display;
+      for(i = 0; i < len; i++) {
+        msnprintf(ptr, limit, "%02X", buffer[i]);
+        ptr += 2;
+        limit -= 2;
+      }
+      infof(data, "        - extensions (%d): '%s'\n", len, display);
+      free(display);
+    }
+    progress = 2 + len;
+  }
+  return progress;
+}
+
+static size_t display_public_key(struct Curl_easy *data,
+                                       unsigned char *buffer, size_t more)
+{
+  size_t progress;
+  uint16_t len = get16bit(buffer, 0);
+  if(len > (more - 2)) {
+    progress = more;            /* mark rest of buffer done */
+  }
+  else {
+    size_t limit = 2 * len;
+    char *display = calloc(1, limit + 1);
+    buffer += 2;
+    if(display) {
+      int i;
+      char *ptr = display;
+      for(i = 0; i < len; i++) {
+        msnprintf(ptr, limit, "%02X", buffer[i]);
+        ptr += 2;
+        limit -= 2;
+      }
+      infof(data, "        - public_key (%d): '%s'\n", len, display);
+      free(display);
+    }
+    progress = 2 + len;
+  }
+  return progress;
+}
+
+static void display_ECHConfigContents(struct Curl_easy *data,
+                                      unsigned char *buffer, size_t more)
+{
+  size_t progress;
+  infof(data, "      - ECHConfigContents:\n");
+  if(more) {
+    progress = display_public_name(data, buffer, more);
+    more -= progress;
+    buffer += progress;
+  }
+
+  if(more) {
+    progress = display_public_key(data, buffer, more);
+    more -= progress;
+    buffer += progress;
+  }
+
+  if(more > 1) {
+    uint16_t kem_id = get16bit(buffer, 0);
+    infof(data, "        - kem_id: 0x%04X\n", kem_id);
+    more += 2;
+    buffer += 2;
+  }
+  else {
+    more = 0;
+  }
+
+  if(more) {
+    progress = display_cipher_suites(data, buffer, more);
+    more -= progress;
+    buffer += progress;
+  }
+
+  if(more) {
+    progress = display_extensions(data, buffer, more);
+    more -= progress;
+    buffer += progress;
+  }
+  return;
+}
+
+static void display_generic_SvcParamValue(struct Curl_easy *data,
+                                          unsigned char *buffer, size_t stock)
+{
+  char *tail = (char *) ((stock > 32) ? "..." : "");
+  char display[32 + 32 + 1];
+  char *p = display;
+  size_t available = 32 + 32;
+  unsigned int i;
+  for(i = 0; i < ((stock > 32) ? 32 : stock); i++) {
+    msnprintf(p, available, "%02X", (unsigned char) buffer[i]);
+    available -= 2;
+    p += 2;
+  }
+  infof(data, "    - SvcParamValue (%d): %s%s\n", stock, display, tail);
+}
+
+static bool display_ECHConfig(struct Curl_easy *data,
+                              unsigned char *buffer, size_t stock)
+{
+  bool error = NULL;
+  unsigned short version;
+  unsigned short cont_len;
+
+  if(stock <= 4) {
+
+  }
+
+  while(!error && (stock > 4)) {
+    version = get16bit(buffer, 0);
+    infof(data, "      - ECHConfig version 0x%04X\n", version);
+
+    switch(version) {
+
+    case 0xFF07:
+      cont_len = get16bit(buffer, 2);
+      if(cont_len > (stock - 4)) {
+        infof(data, "      - ECHConfigContents exceeds buffer length\n");
+        error = TRUE;
+      }
+      else {
+        display_ECHConfigContents(data, buffer + 4, cont_len);
+        stock -= (4 + cont_len);
+        buffer += (4 + cont_len);
+      }
+      break;
+
+    default:
+      /* Unrecognized version: use generic display instead */
+      infof(data,
+            "        - version not recognized: using generic display\n");
+      display_generic_SvcParamValue(data, buffer, stock);
+      stock = 0;                /* mark it done */
+      break;
+    }
+  }
+
+  if(stock && !error) {
+    infof(data, "      - residual data (%d) after ECHConfig \n", stock);
+    error = TRUE;
+  }
+  return error;
+}
+
+static bool display_ECHConfigs(struct Curl_easy *data,
+                               unsigned char *buffer, size_t paramlen)
+{
+  bool error = NULL;
+  unsigned short len = get16bit(buffer, 0);
+  infof(data, "    - SvcParamValue (%d):\n", paramlen);
+  infof(data, "      - ECHConfigs length: %d\n", len);
+  if(len > (paramlen - 2)) {
+    infof(data, "      - ECHConfigs exceeds buffer length\n");
+    error = TRUE;
+  }
+  else
+    error = display_ECHConfig(data, buffer + 2, len);
+  return error;
+}
+
+/* TODO: consider using ares_inet_ntop() if available */
+static const char *
+doh_inet_ntop(int af, const void *src, char *dst, size_t size)
+{
+  char *result = NULL;
+  unsigned char *s = (unsigned char *) src;
+
+  if(dst) {
+    if((af == AF_INET6) && (size >= INET6_ADDRSTRLEN)) {
+      int j;
+      char *ptr = dst;
+      struct {
+        int len;
+        char *pos;
+      } cursor[2], *latest = NULL, *kept = NULL;
+      size_t len;
+
+      /* TODO: consider using inet_ntop() instead of custom code */
+      for(j = 0; j < 16; j += 2) {
+        size_t l;
+        if(s[j])
+          msnprintf(ptr, len, "%s%x%02x", j?":":"", s[j], s[j + 1]);
+        else {
+          msnprintf(ptr, len, "%s%x", j?":":"", s[j + 1]);
+          if(!s[j + 1]) {
+            /* Zero word: may need compressed presentation */
+            if(!latest) {
+              /* Not yet tracking a run of zero words */
+              latest = cursor;
+              latest->pos = ptr;
+              latest->len = 2;
+            }
+            else if(latest->pos + latest->len == ptr) {
+              /* Current position belongs to latest run */
+              latest->len += 2;
+            }
+            else if(!kept) {
+              /* Only a single run was tracked so far */
+              /* Choose earlier one and move on */
+              kept = latest++;
+              latest->pos = ptr;
+              latest->len = 2;
+            }
+            else if(kept->len > latest->len) {
+              /*  */
+              latest->pos = ptr;
+              latest->len = 2;
+            }
+            else {
+              /* Choose later one */
+              if(latest > kept)
+                kept = latest--;
+              else
+                kept = latest++;
+              latest->pos = ptr;
+              latest->len = 2;
+            }
+          }
+        }
+        l = strlen(ptr);
+        len -= l;
+        ptr += l;
+      }
+      /* infof(data, "%s\n", buffer); */
+      if(latest) {
+        if(kept) {
+          if(latest->len > kept->len)
+            kept = latest;
+        }
+        else
+          kept = latest;
+      }
+      if(kept) {
+        strcpy(kept->pos + 1, kept->pos + kept->len);
+      }
+      result = dst;
+    }
+    else if((af == AF_INET) && (size >= INET_ADDRSTRLEN)) {
+      msnprintf(dst, size, "%u.%u.%u.%u", s[0], s[1], s[2], s[3]);
+      result = dst;
+    }
+  }
+  return result;
+}
+
+static const char *paramkeyname(uint16_t key)
+{
+  const char *name = NULL;
+  switch(key) {
+  case 0:
+    name = "NO NAME -- reserved";
+    break;
+  case 1:
+    name = "alpn";
+    break;
+  case 2:
+    name = "no-default-alpn";
+    break;
+  case 3:
+    name = "port";
+    break;
+  case 4:
+    name = "ipv4hint";
+    break;
+  case 5:
+    name = "echconfig";
+    break;
+  case 6:
+    name = "ipv6hint";
+    break;
+  case 65535:
+    name = "key65535 -- reserved";
+    break;
+  }
+  if(!name) {
+    if((key >= 65280) && (key <= 65534))
+      name = "keyNNNNN -- private use";
+    else
+      name = "UNRECOGNIZED";
+  }
+  return name;
+}
+
+static bool display_SvcParams(struct Curl_easy *data,
+                                  unsigned char *buffer, size_t stock)
+{
+  /* TODO: consider enum type rather than bool */
+
+  bool error = NULL;            /* So far, so good */
+  uint16_t key;
+  uint16_t prev_key = 0;
+  uint16_t paramlen;
+  uint16_t count;
+  int i;
+
+  (void) i;                     /* TODO */
+
+  infof(data, "    SvcParams bytes to be processed: %d\n", stock);
+
+  while(stock && !error) {
+    if(stock < 4) {
+      /* Unable to fit key, length */
+      infof(data, "    invalid SvcParams: buffer too short\n");
+      error = TRUE;
+      break;
+    }
+
+    key = get16bit(buffer, 0);
+    infof(data, "    - SvcParamKey: %d (%s)\n", key, paramkeyname(key));
+    if(key <= prev_key) {
+      infof(data, "      SvcParamKey invalid: out of order\n");
+      error = TRUE;
+      break;
+    }
+
+    paramlen = get16bit(buffer, 2);
+    buffer += 4;                /* advance past parameter length */
+    stock -= 4;                 /* and adjust stock level */
+    /* infof(data, "    - SvcParamValue (%d):\n", paramlen); */
+
+    if(paramlen > stock) {
+      infof(data, "      invalid parameter length: too big\n");
+      error = TRUE;
+      break;
+    }
+
+    if((key != 2) &&            /* exclude special case */
+       (!paramlen)) {           /* otherwise, expect parameter data */
+      infof(data, "      invalid parameter length: zero");
+      error = TRUE;
+    }
+
+    if(!error) {
+      switch(key) {
+
+      case 1:
+        /* alpn: Additional supported protocols */
+        /*       Expect:
+         *       - unsigned 8-bit count
+         *       - octets
+         */
+        count = (unsigned char) *buffer; /* first byte is count */
+        if(count >= paramlen) {
+          infof(data, "      alpn-id list invalid: too long\n");
+          error = TRUE;
+        }
+        if(!error) {
+          /* TODO: Display count and URL-encoded alpn-id list */
+          /* for now, use generic display */
+          display_generic_SvcParamValue(data, buffer, paramlen);
+        }
+        break;
+
+      case 2:
+        /* no-default-alpn: No supprt for default protocol */
+        if(paramlen) {
+          infof(data,
+                "      invalid (non-empty) value"
+                " for key 'no-default-alpn'\n");
+          error = TRUE;
+        }
+        break;
+
+      case 3:
+        /* port: Port for alternative service */
+        /*       Expect:
+         *       - paramlen == 2
+         *       - unsigned 16-bit port number
+         */
+        if(paramlen == 2) {
+          uint16_t port;
+          port = get16bit(buffer, 0);
+          infof(data, "    - SvcParamValue (%d): %d\n", paramlen, port);
+        }
+        else {
+          infof(data,
+                "       port: invalid parameter length: too %s\n",
+                (paramlen < 2) ? "short" : "long"
+                );
+          error = TRUE;
+        }
+        break;
+
+      case 5:
+        /* echconfig: Encrypted ClientHello info            */
+        display_ECHConfigs(data, buffer, paramlen);
+        break;
+
+      case 4:
+      case 6:
+        {
+          char pres[INET6_ADDRSTRLEN];
+          unsigned char *p = buffer;
+          int step = (key == 6) ? 16 : 4;
+          int af = (key == 6) ? AF_INET6 : AF_INET;
+
+          infof(data, "    - SvcParamValue (%d):\n", paramlen);
+          for(i = 0; i < paramlen; i += step, p += step) {
+            if(doh_inet_ntop(af, p, pres, INET6_ADDRSTRLEN))
+              infof(data, "      - %s\n", pres);
+            else
+              infof(data, "      - error formatting address\n");
+          }
+        }
+        break;
+
+      default:
+        /* Generic display */
+        display_generic_SvcParamValue(data, buffer, paramlen);
+        break;
+
+      }
+    }
+
+    if(!error) {
+      /* Advance past current parameter */
+      buffer += paramlen;
+      stock -= paramlen;
+
+      /* Report count of remaining bytes */
+      infof(data, "    SvcParams bytes remaining: %d\n", stock);
+    }
+  } /* while(stock && !error) */
+
+  return error;
+}
+
 static void showdoh(struct Curl_easy *data,
                     struct dohentry *d)
 {
   int i;
 #ifdef USE_ESNI
-  size_t truncate = 32;
+  size_t truncate = 48;
   size_t repr;
   char *tail;
   char *display = NULL;
@@ -1075,29 +1590,15 @@ static void showdoh(struct Curl_easy *data,
 
   infof(data, "TTL: %u seconds\n", d->ttl);
   for(i = 0; i < d->numaddr; i++) {
+    char buffer[INET6_ADDRSTRLEN];
     struct dohaddr *a = &d->addr[i];
     if(a->type == DNS_TYPE_A) {
-      infof(data, "DOH A: %u.%u.%u.%u\n",
-            a->ip.v4[0], a->ip.v4[1],
-            a->ip.v4[2], a->ip.v4[3]);
+      if(doh_inet_ntop(AF_INET, a->ip.v4, buffer, INET6_ADDRSTRLEN))
+        infof(data, "DOH A: %s\n", buffer);
     }
     else if(a->type == DNS_TYPE_AAAA) {
-      int j;
-      char buffer[128];
-      char *ptr;
-      size_t len;
-      msnprintf(buffer, 128, "DOH AAAA: ");
-      ptr = &buffer[10];
-      len = 118;
-      for(j = 0; j < 16; j += 2) {
-        size_t l;
-        msnprintf(ptr, len, "%s%02x%02x", j?":":"", d->addr[i].ip.v6[j],
-                  d->addr[i].ip.v6[j + 1]);
-        l = strlen(ptr);
-        len -= l;
-        ptr += l;
-      }
-      infof(data, "%s\n", buffer);
+      if(doh_inet_ntop(AF_INET6, d->addr[i].ip.v6, buffer, INET6_ADDRSTRLEN))
+        infof(data, "DOH AAAA: %s\n", buffer);
     }
   }
   for(i = 0; i < d->numcname; i++) {
@@ -1108,10 +1609,12 @@ static void showdoh(struct Curl_easy *data,
     unsigned char *buffer = d->svcb_data[i].alloc;
     size_t buflen = d->svcb_data[i].len;
     uint16_t priority;
-    int count;
+    size_t count;
     bool error = NULL;
 
-    /* TODO: work out what libcurl utility finction does this */
+    (void) error;               /* TODO: use or lose this variable */
+
+    /* TODO: consider using msnprintf instead */
     display = bin2hex(display, &displen,
                       buffer, buflen,
                       truncate);
@@ -1124,14 +1627,15 @@ static void showdoh(struct Curl_easy *data,
 
       if(buflen >= 2) {
         /* Priority (SvcRecordType) */
-        priority = (((255 & buffer[0])<<8) | (255 & buffer[1]));
+        /* priority = (((255 & buffer[0])<<8) | (255 & buffer[1])); */
+        priority = get16bit(buffer, 0);
         buffer += 2;
         buflen -= 2;
-        infof(data, "    Priority: %d (%s)\n",
+        infof(data, "    SvcPriority: %d (%s)\n",
               priority,
-              (priority ? "ServiceForm" : "AliasForm"));
+              (priority ? "ServiceMode" : "AliasMode"));
 
-        /* SvcDomainName */
+        /* TargetName */
         count = wire2name(display, displen, buffer, buflen);
         if(count > 0) {
           infof(data, "    SvcDomaimName: '%s'\n", display);
@@ -1139,57 +1643,30 @@ static void showdoh(struct Curl_easy *data,
           buflen -= count;
         }
         else {
-          infof(data, "    SvcDomainName: invalid (error code: %d)\n", count);
+          infof(data, "    TargetName: invalid (error code: %d)\n", count);
           break;
         }
 
         if(priority) {
-          /* ServiceForm -- expect:                        */
-          /* - ScvDomainName -- may be just an empty label */
-          /* - one (zero?) or more SvcFieldValues          */
+          /* ServiceMode -- expect:                        */
+          /* - one (zero?) or more SvcParamss          */
           if(!buflen) {
-            infof(data, "    no SvcFieldValue found\n");
+            infof(data, "    no SvcParams found\n");
           }
           else {
-            while(buflen && !error) {
-              uint16_t have_key = 0;
-              uint16_t key;
-              uint16_t paramlen;
-              if(buflen < 4) {
-                /* Need at least key and length, each two bytes long */
-                infof(data, "    invalid SvcFieldValue: too short\n");
-              }
-              else {
-                key  = (((255 & buffer[0])<<8) | (255 & buffer[1]));
-                buffer += 2;
-                buflen -= 2;
-                infof(data, "    SvcParamKey: %d\n", key);
-                if(key <= have_key) {
-                  infof(data, "    invalid SvcParamKey: out of order\n");
-                  error = TRUE;
-                }
-                else {
-                  paramlen  = (((255 & buffer[0])<<8) | (255 & buffer[1]));
-                  buffer += 2;
-                  buflen -= 2;
-                  if(paramlen > buflen) {
-                    infof(data, "    invalid parameter length: too big\n");
-                    error = TRUE;
-                  }
-                  infof(data, "    SvcParamVal: (%d) (TBD)\n", paramlen);
-                  buffer += paramlen;
-                  buflen -= paramlen;
-                }
-                have_key = key;
-              }
-            } /* Next SvcFieldValue */
+            display_SvcParams(data, buffer, buflen);
           }
         }
         else {
-          /* AliasForm -- expect buffer already exhausted  */
+          /* AliasMode -- expect buffer already exhausted */
           if(buflen) {
-            infof(data, "    unexpected residual data after SvcDomNm\n");
+            infof(data,
+                  "    unexpected residual data after TargetName\n");
           }
+          /* TODO (but not here): follow alias, as for CNAME,
+           *       compensating if necessary in case resolver is
+           *       unaware of this kind of aliasing
+           */
         }
       }
     }
@@ -1367,11 +1844,11 @@ doh2et(const struct dohentry *de, const char *hostname, int port)
   for(i = 0, p = aggrdata; i < de->num_esni_txt; i++) {
     if(i)
       *p++ = ';';       /* separate each string from the one before */
-    strcpy(p, de->esni_txt[i].alloc); /* copy string */
+    strcpy(p, (char *) de->esni_txt[i].alloc); /* copy string */
     p += de->esni_txt[i].len;         /* update cursor */
   }
 
-  return aggrdata;
+  return (void *) aggrdata;
 }
 #endif
 

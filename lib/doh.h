@@ -67,17 +67,14 @@ typedef enum {
   DNS_TYPE_TXT = 16,
   DNS_TYPE_AAAA = 28,
   DNS_TYPE_DNAME = 39,          /* RFC6672 */
-  /* TODO ********************************************************** *
-   * replace temporary code-points with assigned ones when available *
-   * *************************************************************** */
-  DNS_TYPE_SVCB = 65481,
-  DNS_TYPE_HTTPS = 65482
+  DNS_TYPE_SVCB = 64,           /* was provisionally 65481 */
+  DNS_TYPE_HTTPS = 65           /* was provisionally 65482 */
 } DNStype;
 
 #define DOH_MAX_ADDR 24
 #define DOH_MAX_CNAME 8
 #define DOH_MAX_ESNI_TXT 4
-#define DOH_MAX_SVCB_DATA 4
+#define DOH_MAX_SVCB_DATA 12    /* eg. 8x alias + 4x service, or what? */
 
 struct cnamestore {
   /* TODO: establish whether this is used for anything */
