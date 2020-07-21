@@ -57,12 +57,16 @@ static const char * const errors[]={
   "Unexpected TYPE",
   "Unexpected CLASS",
   "No content",
-  "Bad ID"
+  "Bad ID",
+  "Name too long",
+  "Port out of range",
+  "Bad QDCOUNT",
+  "NAME mismatch"
 };
 
 static const char *doh_strerror(DOHcode code)
 {
-  if((code >= DOH_OK) && (code <= DOH_DNS_BAD_ID))
+  if((code >= DOH_OK) && (code < DOH_DNS_UNSUPPORTED))
     return errors[code];
   return "bad error code";
 }
@@ -585,6 +589,97 @@ static unsigned int get32bit(unsigned char *doh, int index)
   return ( (unsigned)doh[0] << 24) | (doh[1] << 16) |(doh[2] << 8) | doh[3];
 }
 
+static DOHcode acceptname(unsigned char *doh, size_t dohlen,
+                          unsigned int *indexp,
+                          unsigned char *expect)
+{
+  /* Arguments:
+   * - doh:    pointer to a buffer containing a DNS response
+   * - dohlen: length of DNS response in this buffer
+   * - indexp: pointer to offset into buffer of current position
+   * - expect: pointer to an uncompressed expected DNS label sequence, or
+   *           NULL to indicate that matching is not required
+   *
+   * Function:
+   *   A DNS label sequence starting at the current position
+   *   is validated for correct format and for matching the
+   *   expected label sequence, if specified
+   *
+   *   If validation is successful, the offset is updated past
+   *   the validated label sequence and DOH_OK is returned.
+   *
+   *   Otherwise an error code is returned.
+   *
+   * Implementation notes:
+   *   If the expect argument points inside the DNS response data
+   *   ((expect >= doh) && (expect < doh + dohlen)), then a label
+   *   sequence consisting only of a name-
+   *   compression pointer whose offset is equal to (expect - doh)
+   */
+
+  unsigned int mark = *indexp;  /* save starting position */
+  unsigned int point = *indexp; /* current position */
+  unsigned int offset = 0;      /* compression pointer value (valid >= 12) */
+  unsigned int totlen = 0;      /* total length of label sequence */
+  unsigned char length;         /* length of each label */
+  bool scanning = TRUE;         /* no compression yet */
+
+  if(mark < 12)
+    return DOH_DNS_MALFORMAT;   /* name must be beyond header */
+
+  do {
+    if(dohlen < (point + 1))
+      return DOH_DNS_OUT_OF_RANGE;
+    length = doh[point];
+    if((length & 0xc0) == 0xc0) {
+      /* compression pointer, check validity */
+      if(dohlen < (point + 2))
+        return DOH_DNS_OUT_OF_RANGE;
+      if(scanning) {
+        *indexp += 2;             /* advance past pointer */
+        scanning = FALSE;         /* done scanning: pointer ends input */
+      }
+
+      /* check offset value in pointer */
+      offset = 0x3fff & get16bit(doh, point);
+      if(dohlen < offset)
+        return DOH_DNS_OUT_OF_RANGE; /* or new DOH_DNS_BAD_POINTER ? */
+      if(!expect)
+        break;                  /* nothing to match, so done with name */
+
+      /* check what we can for match */
+      if(expect == doh + offset) {
+        /* trivial: pointer refers to what is required */
+        expect = NULL;          /* nothing more to expect */
+        break;                  /* done with name, match complete */
+      }
+
+      if(point > mark) {
+        if(memcmp(expect, doh + mark, point - mark))
+          return DOH_DNS_NAME_MISMATCH;
+        expect += point - mark; /* advance past what matched */
+        mark = offset;          /* set new mark from pointer */
+        point = mark;           /* continue matching from there */
+      }
+    }
+    if(length & 0xc0)
+      return DOH_DNS_BAD_LABEL;
+    if(dohlen < (point + 1 + length))
+      return DOH_DNS_OUT_OF_RANGE;
+    point += 1 + length;
+    totlen += 1 + length;
+    if(scanning)
+      *indexp += 1 + length;
+    if(totlen > 255)
+      return DOH_DNS_NAME_TOO_LONG;
+  } while(length);
+
+  if(expect && memcmp(expect, doh + mark, point - mark))
+    return DOH_DNS_NAME_MISMATCH;
+
+  return DOH_OK;
+}
+
 static DOHcode store_a(unsigned char *doh, int index, struct dohentry *d)
 {
   /* silently ignore addresses over the limit */
@@ -614,14 +709,14 @@ static DOHcode cnameappend(struct cnamestore *c,
                            size_t len)
 {
   if(!c->alloc) {
-    c->allocsize = len + 1;
+    c->allocsize = len;
     c->alloc = malloc(c->allocsize);
     if(!c->alloc)
       return DOH_OUT_OF_MEM;
   }
-  else if(c->allocsize < (c->allocsize + len + 1)) {
-    char *ptr;
-    c->allocsize += len + 1;
+  else if(c->allocsize < (c->allocsize + len)) {
+    unsigned char *ptr;
+    c->allocsize += len;
     ptr = realloc(c->alloc, c->allocsize);
     if(!ptr) {
       free(c->alloc);
@@ -631,7 +726,7 @@ static DOHcode cnameappend(struct cnamestore *c,
   }
   memcpy(&c->alloc[c->len], src, len);
   c->len += len;
-  c->alloc[c->len] = 0; /* keep it zero terminated */
+  /* c->alloc[c->len] = 0; /\* keep it zero terminated *\/ */
   return DOH_OK;
 }
 
@@ -653,36 +748,22 @@ static DOHcode store_cname(unsigned char *doh,
       return DOH_DNS_OUT_OF_RANGE;
     length = doh[index];
     if((length & 0xc0) == 0xc0) {
-      int newpos;
-      /* name pointer, get the new offset (14 bits) */
       if((index + 1) >= dohlen)
         return DOH_DNS_OUT_OF_RANGE;
-
-      /* move to the new index */
-      newpos = (length & 0x3f) << 8 | doh[index + 1];
-      index = newpos;
-      continue;
+      index = 0x3fff & get16bit(doh, index);
     }
+
     else if(length & 0xc0)
       return DOH_DNS_BAD_LABEL; /* bad input */
-    else
-      index++;
 
-    if(length) {
+    else {
       DOHcode rc;
-      if(c->len) {
-        rc = cnameappend(c, (unsigned char *)".", 1);
-        if(rc)
-          return rc;
-      }
-      if((index + length) > dohlen)
-        return DOH_DNS_BAD_LABEL;
-
-      rc = cnameappend(c, &doh[index], length);
+      rc = cnameappend(c, &doh[index], length + 1);
       if(rc)
         return rc;
-      index += length;
+      index += length + 1;
     }
+
   } while(length && --loop);
 
   if(!loop)
@@ -741,12 +822,13 @@ static DOHcode store_esni_txt(unsigned char *doh,
 }
 
 static DOHcode store_svcb_rdata(unsigned char *doh,
-                              size_t dohlen,
-                              unsigned int index,
-                              unsigned short rdlength,
-                              struct dohentry *d)
+                                size_t dohlen,
+                                unsigned short type,
+                                unsigned int index,
+                                unsigned short rdlength,
+                                struct dohentry *d)
 {
-  struct txtstore *c;
+  struct svcbstore *c;
   size_t rdlen;
   unsigned char *src;
 
@@ -759,6 +841,7 @@ static DOHcode store_svcb_rdata(unsigned char *doh,
   c = &d->svcb_data[d->num_svcb_data++];
   c->allocsize = rdlen;
   c->alloc = calloc(1, c->allocsize);
+  c->type = type;
 
   if(!c->alloc)
     return DOH_OUT_OF_MEM;
@@ -815,7 +898,7 @@ static DOHcode rdata(unsigned char *doh,
     break;
   case DNS_TYPE_SVCB:
   case DNS_TYPE_HTTPS:
-    rc = store_svcb_rdata(doh, dohlen, index, rdlength, d);
+    rc = store_svcb_rdata(doh, dohlen, type, index, rdlength, d);
     if(rc)
       return rc;
     break;
@@ -835,9 +918,181 @@ static void init_dohentry(struct dohentry *de)
   de->ttl = INT_MAX;
 }
 
+static DOHcode doh_decode_in_context(struct dnsprobe *p,
+                                     struct dohentry *d)
+{
+  /* TODO: consider adding unit test for this */
+
+  unsigned char rcode;
+  unsigned short qdcount;
+  unsigned short ancount;
+  unsigned short type = 0;
+  unsigned short rdlength;
+  unsigned short nscount;
+  unsigned short arcount;
+  unsigned int index = 12;
+  DOHcode rc;
+
+  /* For convenience: references to certain elements of query context */
+  unsigned char *qry = p->dohbuffer;        /* query */
+  unsigned char *doh = p->serverdoh.memory; /* response */
+  size_t dohlen = p->serverdoh.size;        /* length of response */
+  DNStype dnstype = p->dnstype;             /* query TYPE */
+  unsigned char *expected = qry + 12;       /* QNAME */
+
+  /* Add others as needed */
+  /* char *prefix = p->prefix; */
+
+  if(dohlen < 12)
+    return DOH_TOO_SMALL_BUFFER; /* too small */
+
+  /* if(!doh || doh[0] || doh[1]) */
+  /*   return DOH_DNS_BAD_ID; /\* bad ID *\/ */
+  if(!doh || doh[0] != qry[0] || doh[1] != qry[1])
+    return DOH_DNS_BAD_ID; /* bad ID */
+
+  rcode = doh[3] & 0x0f;
+  if(rcode)
+    return DOH_DNS_BAD_RCODE; /* bad rcode */
+
+  qdcount = get16bit(doh, 4);
+  if(qdcount != 1)              /* We don't send compound queries */
+    return DOH_DNS_BAD_QDCOUNT;
+
+  while(qdcount) {
+    /* rc = skipqname(doh, dohlen, &index); */
+    rc = acceptname(doh, dohlen, &index, expected);
+    if(rc)
+      return rc; /* bad qname */
+
+    /* QNAME in response matches that in query, and is within range
+     * for any compression pointers later in response
+     */
+    expected = doh + 12;        /* instead of qry + 12 */
+
+    if(dohlen < (index + 4))
+      return DOH_DNS_OUT_OF_RANGE;
+    index += 4; /* skip question's type and class */
+    qdcount--;
+  }
+
+  ancount = get16bit(doh, 6);
+  while(ancount) {
+    unsigned short class;
+    unsigned int ttl;
+
+    rc = acceptname(doh, dohlen, &index, expected);
+    if(rc)
+      return rc; /* bad qname */
+
+    if(dohlen < (index + 2))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    type = get16bit(doh, index);
+    if((type != DNS_TYPE_CNAME)    /* may be synthesized from DNAME */
+       && (type != DNS_TYPE_DNAME) /* if present, accept and ignore */
+       && (type != dnstype))
+      /* Not the same type as was asked for nor CNAME nor DNAME */
+      return DOH_DNS_UNEXPECTED_TYPE;
+    index += 2;
+
+    if(dohlen < (index + 2))
+      return DOH_DNS_OUT_OF_RANGE;
+    class = get16bit(doh, index);
+    if(DNS_CLASS_IN != class)
+      return DOH_DNS_UNEXPECTED_CLASS; /* unsupported */
+    index += 2;
+
+    if(dohlen < (index + 4))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    ttl = get32bit(doh, index);
+    if(ttl < d->ttl)            /* Shorter than limit so far ? */
+      d->ttl = ttl;             /* Yes: keep the shorter one */
+    index += 4;
+
+    if(dohlen < (index + 2))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    rdlength = get16bit(doh, index);
+    index += 2;
+    if(dohlen < (index + rdlength))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    rc = rdata(doh, dohlen, rdlength, type, index, d);
+    if(rc)
+      return rc; /* bad rdata */
+
+    /* CNAME: update expected name from rdata */
+    if(type == DNS_TYPE_CNAME)
+      expected = d->cname[d->numcname].alloc;
+
+    index += rdlength;
+    ancount--;
+  }
+
+  nscount = get16bit(doh, 8);
+  while(nscount) {
+    /* Check well-formedness and ignore */
+    rc = skipqname(doh, dohlen, &index);
+    if(rc)
+      return rc; /* bad qname */
+
+    if(dohlen < (index + 8))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    index += 2 + 2 + 4; /* type, class and ttl */
+
+    if(dohlen < (index + 2))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    rdlength = get16bit(doh, index);
+    index += 2;
+    if(dohlen < (index + rdlength))
+      return DOH_DNS_OUT_OF_RANGE;
+    index += rdlength;
+    nscount--;
+  }
+
+  arcount = get16bit(doh, 10);
+  while(arcount) {
+    /* Check well-formedness and ignore */
+    /* TODO:
+     * take advantage of additional section for SVCB-compatible type */
+    rc = skipqname(doh, dohlen, &index);
+    if(rc)
+      return rc; /* bad qname */
+
+    if(dohlen < (index + 8))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    index += 2 + 2 + 4; /* type, class and ttl */
+
+    if(dohlen < (index + 2))
+      return DOH_DNS_OUT_OF_RANGE;
+
+    rdlength = get16bit(doh, index);
+    index += 2;
+    if(dohlen < (index + rdlength))
+      return DOH_DNS_OUT_OF_RANGE;
+    index += rdlength;
+    arcount--;
+  }
+
+  if(index != dohlen)
+    return DOH_DNS_MALFORMAT; /* unexpected residual data */
+
+  if(((type == DNS_TYPE_A) || (type == DNS_TYPE_AAAA)) &&
+     !d->numcname && !d->numaddr)
+    /* TODO: take account of DNS being about more than just address data */
+    /* nothing stored! */
+    return DOH_NO_CONTENT;
+
+  return DOH_OK; /* ok */
+}
 
 UNITTEST DOHcode doh_decode(unsigned char *doh,
-                            size_t dohlen,
+                            size_t dohlen, /* overloaded to select decoder */
                             DNStype dnstype,
                             struct dohentry *d)
 {
@@ -967,7 +1222,8 @@ UNITTEST DOHcode doh_decode(unsigned char *doh,
   if(index != dohlen)
     return DOH_DNS_MALFORMAT; /* something is wrong */
 
-  if((type != DNS_TYPE_NS) && !d->numcname && !d->numaddr)
+  if(((type == DNS_TYPE_A) || (type == DNS_TYPE_AAAA)) &&
+     !d->numcname && !d->numaddr)
     /* nothing stored! */
     return DOH_NO_CONTENT;
 
@@ -1323,10 +1579,9 @@ doh_inet_ntop(int af, const void *src, char *dst, size_t size)
       struct {
         int len;
         char *pos;
-      } cursor[2], *latest = NULL, *kept = NULL;
+      } cursor[2], *busy = NULL, *kept = NULL;
       size_t len;
 
-      /* TODO: consider using inet_ntop() instead of custom code */
       for(j = 0; j < 16; j += 2) {
         size_t l;
         if(s[j])
@@ -1335,36 +1590,42 @@ doh_inet_ntop(int af, const void *src, char *dst, size_t size)
           msnprintf(ptr, len, "%s%x", j?":":"", s[j + 1]);
           if(!s[j + 1]) {
             /* Zero word: may need compressed presentation */
-            if(!latest) {
-              /* Not yet tracking a run of zero words */
-              latest = cursor;
-              latest->pos = ptr;
-              latest->len = 2;
-            }
-            else if(latest->pos + latest->len == ptr) {
-              /* Current position belongs to latest run */
-              latest->len += 2;
-            }
-            else if(!kept) {
-              /* Only a single run was tracked so far */
-              /* Choose earlier one and move on */
-              kept = latest++;
-              latest->pos = ptr;
-              latest->len = 2;
-            }
-            else if(kept->len > latest->len) {
-              /*  */
-              latest->pos = ptr;
-              latest->len = 2;
+            if(busy && (busy->pos + busy->len == ptr)) {
+              /* Current position belongs to busy run */
+              busy->len += 2;   /* Just update length of current run */
             }
             else {
-              /* Choose later one */
-              if(latest > kept)
-                kept = latest--;
-              else
-                kept = latest++;
-              latest->pos = ptr;
-              latest->len = 2;
+              /* Fresh run -- must do housekeeping */
+              if(!busy) {
+                /* Not yet tracking a run of zero words */
+                busy = cursor;  /* Select first cursor as busy */
+                kept = busy;    /* First run so far, so keep it */
+              }
+              else if(kept == busy) {
+                /* Fresh run with only one previous */
+                /* Keep earlier one and move on */
+                busy++;         /* Select next cursor as busy */
+              }
+              else if(kept->len <= busy->len) {
+                /* Fresh run where most recent one is to be kept   */
+
+                /* Note: non-strict inequality is biased towards   */
+                /*       keeping later of two runs of equal length */
+
+                /* Swap kept and busy cursors */
+                if(busy > kept)
+                  kept = busy--;
+                else
+                  kept = busy++;
+              }
+
+              /* else
+               *   no housekeeping needed, as busy cursor can be re-used
+               */
+
+              /* After housekeeping, set busy cursor to current position */
+              busy->pos = ptr;
+              busy->len = 2;
             }
           }
         }
@@ -1373,13 +1634,13 @@ doh_inet_ntop(int af, const void *src, char *dst, size_t size)
         ptr += l;
       }
       /* infof(data, "%s\n", buffer); */
-      if(latest) {
+      if(busy) {
         if(kept) {
-          if(latest->len > kept->len)
-            kept = latest;
+          if(busy->len > kept->len)
+            kept = busy;
         }
         else
-          kept = latest;
+          kept = busy;
       }
       if(kept) {
         strcpy(kept->pos + 1, kept->pos + kept->len);
@@ -1576,6 +1837,31 @@ static bool display_SvcParams(struct Curl_easy *data,
   return error;
 }
 
+#ifndef CURL_DISABLE_VERBOSE_STRINGS
+static const char *type2name(DNStype dnstype)
+{
+  switch(dnstype) {
+  case DNS_TYPE_A:
+    return "A";
+  case DNS_TYPE_AAAA:
+    return "AAAA";
+  case DNS_TYPE_CNAME:
+    return "CNAME";
+  case DNS_TYPE_DNAME:
+    return "DNAME";
+  case DNS_TYPE_TXT:
+    return "TXT";
+  case DNS_TYPE_SVCB:
+    return "SVCB";
+  case DNS_TYPE_HTTPS:
+    return "HTTPS";
+  default:
+    return "(unsupported)";
+  /* return (dnstype == DNS_TYPE_A)?"A":"AAAA"; */
+  }
+}
+#endif
+
 static void showdoh(struct Curl_easy *data,
                     struct dohentry *d)
 {
@@ -1594,15 +1880,33 @@ static void showdoh(struct Curl_easy *data,
     struct dohaddr *a = &d->addr[i];
     if(a->type == DNS_TYPE_A) {
       if(doh_inet_ntop(AF_INET, a->ip.v4, buffer, INET6_ADDRSTRLEN))
-        infof(data, "DOH A: %s\n", buffer);
+        infof(data, "DOH %5s: %s\n", "A", buffer);
     }
     else if(a->type == DNS_TYPE_AAAA) {
       if(doh_inet_ntop(AF_INET6, d->addr[i].ip.v6, buffer, INET6_ADDRSTRLEN))
-        infof(data, "DOH AAAA: %s\n", buffer);
+        infof(data, "DOH %5s: %s\n", "AAAA", buffer);
     }
   }
   for(i = 0; i < d->numcname; i++) {
-    infof(data, "CNAME: %s\n", d->cname[i].alloc);
+    char buffer[255] = { '\0' };
+    unsigned int index = 0;
+    unsigned int length;
+    char *dst = buffer;
+    struct cnamestore *c;
+
+    c = &d->cname[i];
+
+    do {
+      length = c->alloc[index];
+      if(length && index++)
+        *(dst++) = '.';
+      memcpy(dst, &c->alloc[index], length);
+      index += length;
+      dst += length;
+    } while(length);
+    *dst = '\0';
+
+    infof(data, "DOH %5s: %s\n", "CNAME", buffer);
   }
 #ifdef USE_ESNI
   for(i = 0; i < d->num_svcb_data; i++) {
@@ -1622,7 +1926,9 @@ static void showdoh(struct Curl_easy *data,
     if(display) {
       repr = strlen(display) / 2;
       tail = (char *) ((repr < buflen) ? "..." : "");
-      infof(data, "DOH svcbdata: (%3d/%-3d) %s%s\n",
+      infof(data, "DOH %s (%d/%d): %s%s\n",
+            (d->svcb_data[i].type) ?
+            type2name(d->svcb_data[i].type) : "svcbdata",
             repr, buflen, display, tail);
 
       if(buflen >= 2) {
@@ -1675,7 +1981,7 @@ static void showdoh(struct Curl_easy *data,
     CURLcode rc;
     size_t declen;
     unsigned char *decbuf = NULL;
-    infof(data, "DOH esni_txt: (%d) %s\n",
+    infof(data, "DOH esni_txt (%d): %s\n",
           strlen((char *)d->esni_txt[i].alloc),
           d->esni_txt[i].alloc);
     rc = Curl_base64_decode((const char *)d->esni_txt[i].alloc,
@@ -1687,7 +1993,7 @@ static void showdoh(struct Curl_easy *data,
       if(display) {
         repr = strlen(display) / 2;
         tail = (char *) ((repr < declen) ? "..." : "");
-        infof(data, "     decoded: (%3d/%-3d) %s%s\n",
+        infof(data, "     decoded (%d/%d): %s%s\n",
               repr, declen, display, tail);
       }
     }
@@ -1852,23 +2158,6 @@ doh2et(const struct dohentry *de, const char *hostname, int port)
 }
 #endif
 
-#ifndef CURL_DISABLE_VERBOSE_STRINGS
-static const char *type2name(DNStype dnstype)
-{
-  switch(dnstype) {
-  case DNS_TYPE_A:
-    return "A";
-  case DNS_TYPE_AAAA:
-    return "AAAA";
-  case DNS_TYPE_TXT:
-    return "TXT";
-  default:
-    return "(unsupported)";
-  /* return (dnstype == DNS_TYPE_A)?"A":"AAAA"; */
-  }
-}
-#endif
-
 UNITTEST void de_cleanup(struct dohentry *d)
 {
   int i = 0;
@@ -1894,10 +2183,13 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
       CURLE_COULDNT_RESOLVE_HOST;
   }
   else if(!data->req.doh.pending) {
-    DOHcode rc[DOH_PROBE_SLOTS];
+    DOHcode rc[DOH_PROBE_SLOTS] = {
+      DOH_OK, DOH_OK
+    };
     struct dohentry de;
     int slot;
     char *prefix = NULL;
+    int type = 0;
     /* remove DOH handles from multi handle and close them */
     for(slot = 0; slot < DOH_PROBE_SLOTS; slot++) {
       curl_multi_remove_handle(data->multi, data->req.doh.probe[slot].easy);
@@ -1906,29 +2198,35 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
     /* parse the responses, create the struct and return it! */
     init_dohentry(&de);
     for(slot = 0; slot < DOH_PROBE_SLOTS; slot++) {
-      prefix = data->req.doh.probe[slot].prefix;
+      struct dnsprobe *p = &data->req.doh.probe[slot];
+      /* prefix = data->req.doh.probe[slot].prefix; */
+      prefix = p->prefix;
       de.prefix = prefix;       /* ? UGLY hack: need context for decoding */
-      infof(data,
-            (prefix ?
-             "DOH: slot %d, qtype %d, prefix '%s', buffer size %d\n" :
-             "DOH: slot %d, qtype %d, prefix %p, buffer size %d\n"),
-            slot,
-            data->req.doh.probe[slot].dnstype,
-            prefix,
-            data->req.doh.probe[slot].serverdoh.size);
-      rc[slot] = doh_decode(data->req.doh.probe[slot].serverdoh.memory,
-                            data->req.doh.probe[slot].serverdoh.size,
-                            data->req.doh.probe[slot].dnstype,
-                            &de);
-      Curl_safefree(data->req.doh.probe[slot].serverdoh.memory);
-      if(rc[slot]) {
-        infof(data, "DOH: %s type %s for %s\n", doh_strerror(rc[slot]),
-              type2name(data->req.doh.probe[slot].dnstype),
-              data->req.doh.host);
+      type = p->dnstype;        /* zero if slot unused */
+
+      if(type) {
+
+        /* /\* Original decoder interface *\/ */
+        /* rc[slot] = doh_decode(p->serverdoh.memory, */
+        /*                       p->serverdoh.size, */
+        /*                       p->dnstype, */
+        /*                       &de); */
+
+        /* New decoder interface */
+        rc[slot] = doh_decode_in_context(p, &de);
       }
-      else {
-        infof(data, "DOH: slot %d, rc %d, ttl %d\n",
-              slot, rc[slot], de.ttl);
+
+      Curl_safefree(p->serverdoh.memory);
+      if(rc[slot] == DOH_DNS_NAME_MISMATCH) {
+        rc[slot] = DOH_OK;      /* TODO: when done testing, treat as error */
+      }
+
+      else if(rc[slot]) {
+        infof(data, "DOH: %s (rc: %d) type %s for %s\n",
+              doh_strerror(rc[slot]),
+              rc[slot],
+              type2name(p->dnstype),
+              data->req.doh.host);
       }
     } /* next slot */
 

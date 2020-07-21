@@ -57,7 +57,12 @@ typedef enum {
   DOH_NO_CONTENT,           /* 11 */
   DOH_DNS_BAD_ID,           /* 12 */
   DOH_DNS_NAME_TOO_LONG,    /* 13 */
-  DOH_PORT_OUT_OF_RANGE     /* 14 */
+  DOH_PORT_OUT_OF_RANGE,    /* 14 */
+  DOH_DNS_BAD_QDCOUNT,      /* 15 */
+  DOH_DNS_NAME_MISMATCH,    /* 16 */
+  /* Add new definitions above here */
+  /* Following definition is for use in last resort */
+  DOH_DNS_UNSUPPORTED
 } DOHcode;
 
 typedef enum {
@@ -78,12 +83,19 @@ typedef enum {
 
 struct cnamestore {
   /* TODO: establish whether this is used for anything */
-  size_t len;       /* length of cname */
-  char *alloc;      /* allocated pointer */
-  size_t allocsize; /* allocated size */
+  size_t len;                /* length of cname */
+  unsigned char *alloc;      /* allocated pointer */
+  size_t allocsize;          /* allocated size */
 };
 
 struct txtstore {
+  size_t len;                /* length of text */
+  unsigned char *alloc;      /* allocated pointer */
+  size_t allocsize;          /* allocated size */
+};
+
+struct svcbstore {
+  int type;
   size_t len;                /* length of text */
   unsigned char *alloc;      /* allocated pointer */
   size_t allocsize;          /* allocated size */
@@ -107,7 +119,7 @@ struct dohentry {
   int num_esni_txt;
   struct txtstore esni_txt[DOH_MAX_ESNI_TXT];
   int num_svcb_data;
-  struct txtstore               /* TODO: dedicated structure ? */
+  struct svcbstore    /* Need type-aware structure, unlike txtstore */
   svcb_data[DOH_MAX_SVCB_DATA];
 };
 

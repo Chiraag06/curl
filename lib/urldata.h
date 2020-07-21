@@ -535,11 +535,15 @@ enum upgrade101 {
 };
 
 enum doh_slots {
-  /* Explicit values for first two symbols so as to match hard-coded
-   * constants in existing code
-   */
-  DOH_PROBE_SLOT_IPADDR_V4 = 0, /* make 'V4' stand out for readability */
-  DOH_PROBE_SLOT_IPADDR_V6 = 1, /* 'V6' likewise */
+  /* Priority order */
+
+#ifdef USE_ESNI
+  /* This one first to ensure result is processed before address data */
+  DOH_PROBE_SLOT_BIND_SVC,   /* ESNI draft 07 uses HTTPS or SVCB */
+#endif
+
+  DOH_PROBE_SLOT_IPADDR_V4,  /* make 'V4' stand out for readability */
+  DOH_PROBE_SLOT_IPADDR_V6,  /* 'V6' likewise */
 
   /* Space here for (possibly build-specific) additional slot definitions */
 
@@ -549,8 +553,7 @@ enum doh_slots {
   /* #endif */
 
 #ifdef USE_ESNI
-  DOH_PROBE_SLOT_ESNI_TXT,      /* ESNI draft 02 uses (TXT, "_esni") */
-  DOH_PROBE_SLOT_BIND_SVC,      /* ESNI draft 07 uses HTTPS or SVCB */
+  DOH_PROBE_SLOT_ESNI_TXT,   /* ESNI draft 02 uses (TXT, "_esni") */
 #endif
 
   /* AFTER all slot definitions, establish how many we have */
