@@ -60,10 +60,21 @@ typedef enum {
   DOH_PORT_OUT_OF_RANGE,    /* 14 */
   DOH_DNS_BAD_QDCOUNT,      /* 15 */
   DOH_DNS_NAME_MISMATCH,    /* 16 */
+  DOH_UNRESOLVED_ALIAS,     /* 17 - no SVCB AliasMode support in resolver */
   /* Add new definitions above here */
   /* Following definition is for use in last resort */
   DOH_DNS_UNSUPPORTED
 } DOHcode;
+
+typedef enum {                  /* RFC1035 */
+  DNS_RC_NOERROR,               /* 0 */
+  DNS_RC_FORMERR,               /* 1 */
+  DNS_RC_SERVFAIL,              /* 2 */
+  DNS_RC_NXDOMAIN,              /* 3 */
+  DNS_RC_NOTIMP,                /* 4 */
+  DNS_RC_REFUSED,               /* 5 */
+  DNS_RC_RESERVED               /* 6 (and beyond) */
+} DNSrcode;
 
 typedef enum {
   DNS_TYPE_A = 1,
@@ -75,6 +86,20 @@ typedef enum {
   DNS_TYPE_SVCB = 64,           /* was provisionally 65481 */
   DNS_TYPE_HTTPS = 65           /* was provisionally 65482 */
 } DNStype;
+
+typedef enum {
+  /* IANA Service Binding (SVCB) Parameter Registry */
+  /* [draft-ietf-dnsop-svcb-https] */
+  DNS_SVCB_PARAM_MANDATORY,
+  DNS_SVCB_PARAM_ALPN,
+  DNS_SVCB_PARAM_NO_DEFAULT_ALPN,
+  DNS_SVCB_PARAM_PORT,
+  DNS_SVCB_PARAM_IPV4HINT,
+  DNS_SVCB_PARAM_ECHCONFIG,
+  DNS_SVCB_PARAM_IPV6HINT,
+  /* Add names above this line as new parameters are registered */
+  DNS_SVCB_PARAMTABLE_SIZE      /* Avoid prefix DNS_SVCB_PARAM_ */
+} DNSsvcbparam;
 
 #define DOH_MAX_ADDR 24
 #define DOH_MAX_CNAME 8
@@ -95,10 +120,20 @@ struct txtstore {
 };
 
 struct svcbstore {
-  int type;
-  size_t len;                /* length of text */
+  int type;                  /* specific type of SVCB-compatible RR */
+  size_t len;                /* length of data */
   unsigned char *alloc;      /* allocated pointer */
   size_t allocsize;          /* allocated size */
+  /* An index (offset) into the data, with an entry for each parameter
+   * registered in IANA's Service Binding (SVCB) Parameter Registry,
+   * allows avoiding a fresh traversal of the data on later reference.
+   *
+   * Note that the first parameter present in the data must lie at
+   * an offset of 2 greater than the length of the fully-qualified
+   * TargetName (in wire format); zero may thus be used to indicate
+   * that the corresponding parameter is not present.
+   */
+  unsigned int index[DNS_SVCB_PARAMTABLE_SIZE];
 };
 
 struct dohaddr {

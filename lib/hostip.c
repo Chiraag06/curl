@@ -574,6 +574,16 @@ enum resolve_t Curl_resolv(struct connectdata *conn,
            a later time, good or bad */
         /* First, check that we haven't received the info by now */
         result = Curl_resolv_check(conn, &dns);
+
+        infof(data, "Curl_resolv_check returned result: %d\n", result);
+        /* TODO:
+         * Catch possible incomplete resolution due to SVCB AliasMode
+         * and then, if using a resolver stack where this is supported:
+         * - queue a fresh set of resolution queries using TargetName
+         *   instead of hostname, and
+         * - set rc = CURLRESOLV_PENDING
+         */
+
         if(result) /* error detected */
           return CURLRESOLV_ERROR;
         if(dns)

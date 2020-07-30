@@ -553,8 +553,9 @@ static DOHcode skipqname(unsigned char *doh, size_t dohlen,
 {
   unsigned char length;
   do {
-    if(dohlen < (*indexp + 1))
+    if(dohlen < ((*indexp) + 1))
       return DOH_DNS_OUT_OF_RANGE;
+
     length = doh[*indexp];
     if((length & 0xc0) == 0xc0) {
       /* name pointer, advance over it and be done */
@@ -826,28 +827,102 @@ static DOHcode store_svcb_rdata(unsigned char *doh,
                                 unsigned short type,
                                 unsigned int index,
                                 unsigned short rdlength,
-                                struct dohentry *d)
+                                struct dohentry *d
+                                , struct Curl_easy *data
+                                )
 {
   struct svcbstore *c;
-  size_t rdlen;
-  unsigned char *src;
+  size_t len = rdlength;
+  unsigned char *src = doh + index;
+  unsigned int offset[DNS_SVCB_PARAMTABLE_SIZE] = { 0 };
+  uint16_t priority;
+  unsigned int parmbase;
+  const unsigned int rdbase = index;
+  DOHcode rc = DOH_OK;
 
-  rdlen = rdlength;
-  src = doh + index;
+  if(len < 3)
+    return DOH_TOO_SMALL_BUFFER; /* too small */
 
-  if(rdlen > dohlen - index)
+  if(len + index > dohlen)
     return DOH_DNS_OUT_OF_RANGE;
 
   c = &d->svcb_data[d->num_svcb_data++];
-  c->allocsize = rdlen;
+  c->allocsize = rdlength;
   c->alloc = calloc(1, c->allocsize);
   c->type = type;
+  c->len = 0;
 
   if(!c->alloc)
     return DOH_OUT_OF_MEM;
 
-  memcpy(c->alloc, src, rdlen);
-  c->len = rdlen;
+  /* From here on, must free workstore.alloc on error */
+
+  /* /\* Copy early, as if good, while debugging parser *\/ */
+  /* memcpy(c->alloc, src, rdlength); */
+  /* c->len = rdlength; */
+
+  /* Parse the RDATA */
+  /* TODO: parse more rigorously by validating parameters */
+
+  priority = get16bit(src, 0);
+  index += 2;                   /* Advance past priority */
+
+  rc = skipqname(doh, dohlen, &index
+                 /* , data */
+                 ); /* Parse TargetName */
+
+  if(!rc) {
+    len -= (index - rdbase);     /* Adjust len to correspond to index */
+
+    /* TODO: resolve type-conversion here */
+    parmbase = rdlength - len;   /* Parameter list follows next */
+
+    if((len && !priority) ||      /* Residual data in AliasForm */
+       (!len && priority))        /* Missing data in ServiceForm */
+      rc = DOH_DNS_MALFORMAT;
+
+    while(len) {
+      unsigned key = 0;
+      unsigned int nextkey;
+      unsigned int parmlen;
+      if(len < 4) {
+        rc = DOH_TOO_SMALL_BUFFER; /* TODO: check appropriate code */
+        break;
+      }
+
+      nextkey = get16bit(doh, index);
+      if(nextkey <= key && index > parmbase) { /* keys must be in order */
+        rc = DOH_DNS_MALFORMAT;
+        break;
+      }
+
+      parmlen = get16bit(doh, index + 2);
+      if(parmlen > len - 4) {
+        rc = DOH_DNS_OUT_OF_RANGE;
+        break;
+      }
+
+      key = nextkey;
+      if(key < DNS_SVCB_PARAMTABLE_SIZE)
+        offset[key] = index - rdbase;
+
+      index += 4 + parmlen;  /* Advance past key, parmlen, parmdata */
+      len -= 4 + parmlen;
+    }
+  }
+
+  if(len) {
+    free(c->alloc);
+    d->num_svcb_data--;
+    return rc;
+  }
+
+  memcpy(c->index, offset, sizeof(offset));
+
+  if(!c->len) {
+    memcpy(c->alloc, src, rdlength);
+    c->len = rdlength;
+  }
 
   return DOH_OK;
 }
@@ -857,7 +932,9 @@ static DOHcode rdata(unsigned char *doh,
                      unsigned short rdlength,
                      unsigned short type,
                      int index,
-                     struct dohentry *d)
+                     struct dohentry *d
+                     , struct Curl_easy *data
+                     )
 {
   /* RDATA
      - A (TYPE 1):  4 bytes
@@ -896,9 +973,11 @@ static DOHcode rdata(unsigned char *doh,
         return rc;
     }
     break;
-  case DNS_TYPE_SVCB:
-  case DNS_TYPE_HTTPS:
-    rc = store_svcb_rdata(doh, dohlen, type, index, rdlength, d);
+  case DNS_TYPE_SVCB:           /* base type */
+  case DNS_TYPE_HTTPS:          /* SVCB-compatible type */
+    rc = store_svcb_rdata(doh, dohlen, type, index, rdlength, d
+                          , data
+                          );
     if(rc)
       return rc;
     break;
@@ -919,7 +998,9 @@ static void init_dohentry(struct dohentry *de)
 }
 
 static DOHcode doh_decode_in_context(struct dnsprobe *p,
-                                     struct dohentry *d)
+                                     struct dohentry *d
+                                     , struct Curl_easy *data
+                                     )
 {
   /* TODO: consider adding unit test for this */
 
@@ -952,11 +1033,12 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
     return DOH_DNS_BAD_ID; /* bad ID */
 
   rcode = doh[3] & 0x0f;
-  if(rcode)
-    return DOH_DNS_BAD_RCODE; /* bad rcode */
+  if(rcode &&                                  /* likely trouble */
+     !(rcode == DNS_RC_NXDOMAIN && p->prefix)) /* missing AttrLeaf is OK */
+    return DOH_DNS_BAD_RCODE;                  /* bad rcode */
 
   qdcount = get16bit(doh, 4);
-  if(qdcount != 1)              /* We don't send compound queries */
+  if(qdcount != 1)       /* We don't send empty or compound queries */
     return DOH_DNS_BAD_QDCOUNT;
 
   while(qdcount) {
@@ -977,11 +1059,15 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
   }
 
   ancount = get16bit(doh, 6);
+  if(!ancount)
+    return DOH_NO_CONTENT;
+
   while(ancount) {
     unsigned short class;
     unsigned int ttl;
 
-    rc = acceptname(doh, dohlen, &index, expected);
+    rc = skipqname(doh, dohlen, &index);
+    /* rc = acceptname(doh, dohlen, &index, expected); */
     if(rc)
       return rc; /* bad qname */
 
@@ -1018,8 +1104,9 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
     index += 2;
     if(dohlen < (index + rdlength))
       return DOH_DNS_OUT_OF_RANGE;
-
-    rc = rdata(doh, dohlen, rdlength, type, index, d);
+    rc = rdata(doh, dohlen, rdlength, type, index, d
+               , data
+               );
     if(rc)
       return rc; /* bad rdata */
 
@@ -1082,11 +1169,12 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
   if(index != dohlen)
     return DOH_DNS_MALFORMAT; /* unexpected residual data */
 
-  if(((type == DNS_TYPE_A) || (type == DNS_TYPE_AAAA)) &&
-     !d->numcname && !d->numaddr)
-    /* TODO: take account of DNS being about more than just address data */
-    /* nothing stored! */
-    return DOH_NO_CONTENT;
+  /* if(((type == DNS_TYPE_A) || (type == DNS_TYPE_AAAA)) && */
+  /*    (!d->numcname && !d->numaddr)) */
+  /*   /\* TODO: */
+  /*    * take account of DNS being about more than just address data  */
+  /*    * nothing stored! *\/ */
+  /*   return DOH_NO_CONTENT; */
 
   return DOH_OK; /* ok */
 }
@@ -1168,7 +1256,7 @@ UNITTEST DOHcode doh_decode(unsigned char *doh,
     if(dohlen < (index + rdlength))
       return DOH_DNS_OUT_OF_RANGE;
 
-    rc = rdata(doh, dohlen, rdlength, type, index, d);
+    rc = rdata(doh, dohlen, rdlength, type, index, d, NULL);
     if(rc)
       return rc; /* bad rdata */
     index += rdlength;
@@ -1580,7 +1668,7 @@ doh_inet_ntop(int af, const void *src, char *dst, size_t size)
         int len;
         char *pos;
       } cursor[2], *busy = NULL, *kept = NULL;
-      size_t len;
+      size_t len = size;
 
       for(j = 0; j < 16; j += 2) {
         size_t l;
@@ -1659,25 +1747,25 @@ static const char *paramkeyname(uint16_t key)
 {
   const char *name = NULL;
   switch(key) {
-  case 0:
-    name = "NO NAME -- reserved";
+  case DNS_SVCB_PARAM_MANDATORY:
+    name = "mandatory";
     break;
-  case 1:
+  case DNS_SVCB_PARAM_ALPN:
     name = "alpn";
     break;
-  case 2:
+  case DNS_SVCB_PARAM_NO_DEFAULT_ALPN:
     name = "no-default-alpn";
     break;
-  case 3:
+  case DNS_SVCB_PARAM_PORT:
     name = "port";
     break;
-  case 4:
+  case DNS_SVCB_PARAM_IPV4HINT:
     name = "ipv4hint";
     break;
-  case 5:
+  case DNS_SVCB_PARAM_ECHCONFIG:
     name = "echconfig";
     break;
-  case 6:
+  case DNS_SVCB_PARAM_IPV6HINT:
     name = "ipv6hint";
     break;
   case 65535:
@@ -1874,7 +1962,9 @@ static void showdoh(struct Curl_easy *data,
   size_t displen;
 #endif
 
-  infof(data, "TTL: %u seconds\n", d->ttl);
+  infof(data, "DOH TTL: %u seconds\n", d->ttl);
+
+  infof(data, "DOH: IP addresses: %u\n", d->numaddr);
   for(i = 0; i < d->numaddr; i++) {
     char buffer[INET6_ADDRSTRLEN];
     struct dohaddr *a = &d->addr[i];
@@ -1883,10 +1973,12 @@ static void showdoh(struct Curl_easy *data,
         infof(data, "DOH %5s: %s\n", "A", buffer);
     }
     else if(a->type == DNS_TYPE_AAAA) {
-      if(doh_inet_ntop(AF_INET6, d->addr[i].ip.v6, buffer, INET6_ADDRSTRLEN))
+      if(doh_inet_ntop(AF_INET6, a->ip.v6, buffer, INET6_ADDRSTRLEN))
         infof(data, "DOH %5s: %s\n", "AAAA", buffer);
     }
   }
+
+  infof(data, "DOH: CNAME references: %u\n", d->numcname);
   for(i = 0; i < d->numcname; i++) {
     char buffer[255] = { '\0' };
     unsigned int index = 0;
@@ -1909,14 +2001,12 @@ static void showdoh(struct Curl_easy *data,
     infof(data, "DOH %5s: %s\n", "CNAME", buffer);
   }
 #ifdef USE_ESNI
+  infof(data, "DOH: Service bindings %u\n", d->num_svcb_data);
   for(i = 0; i < d->num_svcb_data; i++) {
     unsigned char *buffer = d->svcb_data[i].alloc;
     size_t buflen = d->svcb_data[i].len;
     uint16_t priority;
     size_t count;
-    bool error = NULL;
-
-    (void) error;               /* TODO: use or lose this variable */
 
     /* TODO: consider using msnprintf instead */
     display = bin2hex(display, &displen,
@@ -1931,52 +2021,36 @@ static void showdoh(struct Curl_easy *data,
             type2name(d->svcb_data[i].type) : "svcbdata",
             repr, buflen, display, tail);
 
-      if(buflen >= 2) {
-        /* Priority (SvcRecordType) */
-        /* priority = (((255 & buffer[0])<<8) | (255 & buffer[1])); */
-        priority = get16bit(buffer, 0);
-        buffer += 2;
-        buflen -= 2;
-        infof(data, "    SvcPriority: %d (%s)\n",
-              priority,
-              (priority ? "ServiceMode" : "AliasMode"));
+      /* Well-formedness is assured by prior parsing */
 
-        /* TargetName */
-        count = wire2name(display, displen, buffer, buflen);
-        if(count > 0) {
-          infof(data, "    SvcDomaimName: '%s'\n", display);
-          buffer += count;
-          buflen -= count;
-        }
-        else {
-          infof(data, "    TargetName: invalid (error code: %d)\n", count);
-          break;
-        }
+      /* Priority (SvcRecordType) */
+      priority = get16bit(buffer, 0);
+      buffer += 2;
+      buflen -= 2;
+      infof(data, "    SvcPriority: %d (%s)\n",
+            priority,
+            (priority ? "ServiceMode" : "AliasMode"));
 
-        if(priority) {
-          /* ServiceMode -- expect:                        */
-          /* - one (zero?) or more SvcParamss          */
-          if(!buflen) {
-            infof(data, "    no SvcParams found\n");
-          }
-          else {
-            display_SvcParams(data, buffer, buflen);
-          }
-        }
-        else {
-          /* AliasMode -- expect buffer already exhausted */
-          if(buflen) {
-            infof(data,
-                  "    unexpected residual data after TargetName\n");
-          }
-          /* TODO (but not here): follow alias, as for CNAME,
-           *       compensating if necessary in case resolver is
-           *       unaware of this kind of aliasing
-           */
-        }
+      /* TargetName */
+      count = wire2name(display, displen, buffer, buflen);
+      if(count > 0) {
+        infof(data, "    TargetName: '%s'\n", display);
+        buffer += count;
+        buflen -= count;
+      }
+      /* else { */
+      /*   infof(data, */
+      /*         "    TargetName: invalid (error code: %d)\n", count); */
+      /*   break; */
+      /* } */
+
+      if(priority) {
+        display_SvcParams(data, buffer, buflen);
       }
     }
   }
+  infof(data, "DOH: ESNI configurations: %u\n",
+        d->num_esni_txt, (d->num_esni_txt == 1) ? "" : "s");
   for(i = 0; i < d->num_esni_txt; i++) {
     CURLcode rc;
     size_t declen;
@@ -2199,12 +2273,12 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
     init_dohentry(&de);
     for(slot = 0; slot < DOH_PROBE_SLOTS; slot++) {
       struct dnsprobe *p = &data->req.doh.probe[slot];
-      /* prefix = data->req.doh.probe[slot].prefix; */
       prefix = p->prefix;
       de.prefix = prefix;       /* ? UGLY hack: need context for decoding */
       type = p->dnstype;        /* zero if slot unused */
 
       if(type) {
+        uint16_t ancount = 0;
 
         /* /\* Original decoder interface *\/ */
         /* rc[slot] = doh_decode(p->serverdoh.memory, */
@@ -2213,8 +2287,16 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
         /*                       &de); */
 
         /* New decoder interface */
-        rc[slot] = doh_decode_in_context(p, &de);
+        rc[slot] = doh_decode_in_context(p, &de, data);
+        if(rc[slot] != DOH_TOO_SMALL_BUFFER)
+          ancount = get16bit(p->serverdoh.memory, 6);
+
+        infof(data,
+              "DOH: slot %d (QTYPE %2d) decoded; rc: %d, ANCOUNT: %d\n",
+              slot, type, rc[slot], ancount);
       }
+      else
+        infof(data, "DOH: slot %d was not used\n", slot);
 
       Curl_safefree(p->serverdoh.memory);
       if(rc[slot] == DOH_DNS_NAME_MISMATCH) {
@@ -2222,13 +2304,35 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
       }
 
       else if(rc[slot]) {
-        infof(data, "DOH: %s (rc: %d) type %s for %s\n",
+        infof(data, "DOH: %s (rc: %d) type %s for %s%s%s\n",
               doh_strerror(rc[slot]),
               rc[slot],
               type2name(p->dnstype),
+              prefix ? prefix : "",
+              prefix ? "." : "",
               data->req.doh.host);
       }
     } /* next slot */
+
+    infof(data, "DOH Host name: %s\n", data->req.doh.host);
+    showdoh(data, &de);
+
+    /* /\* Check for incomplete SVCB Alias chain *\/ */
+    /* if(de.num_svcb_data) { */
+    /*   /\* We have SVCB data *\/ */
+    /*   int i; */
+    /*   uint16_t priority = 0; */
+    /*   infof(data, "DOH: checking %d SVCB entries\n", de.num_svcb_data); */
+    /*   for(i = 0; i < de.num_svcb_data; i++) { */
+    /*     priority = get16bit(de.svcb_data[i].alloc, 0); */
+    /*     if(priority)            /\* ServiceMode *\/ */
+    /*       break; */
+    /*   } */
+    /*   if(!priority) {           /\* Only AliasMode *\/ */
+    /*     infof(data, "DOH: incomplete SVCB AliasMode chain\n"); */
+    /*     return CURLE_COULDNT_RESOLVE_HOST; */
+    /*   } */
+    /* } */
 
     result = CURLE_COULDNT_RESOLVE_HOST; /* until we know better */
     if(!rc[DOH_PROBE_SLOT_IPADDR_V4] || !rc[DOH_PROBE_SLOT_IPADDR_V6]) {
@@ -2239,8 +2343,8 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
       char *et;
 #endif
 
-      infof(data, "DOH Host name: %s\n", data->req.doh.host);
-      showdoh(data, &de);
+      /* infof(data, "DOH Host name: %s\n", data->req.doh.host); */
+      /* showdoh(data, &de); */
 
 #ifdef USE_ESNI
       et = doh2et(&de, data->req.doh.host, data->req.doh.port);

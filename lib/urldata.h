@@ -542,7 +542,7 @@ enum doh_slots {
   DOH_PROBE_SLOT_BIND_SVC,   /* ESNI draft 07 uses HTTPS or SVCB */
 #endif
 
-  DOH_PROBE_SLOT_IPADDR_V4,  /* make 'V4' stand out for readability */
+  DOH_PROBE_SLOT_IPADDR_V4,  /* make version stand out for readability */
   DOH_PROBE_SLOT_IPADDR_V6,  /* 'V6' likewise */
 
   /* Space here for (possibly build-specific) additional slot definitions */
