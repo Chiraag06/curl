@@ -855,7 +855,7 @@ static DOHcode store_svcb_rdata(unsigned char *doh,
   if(!c->alloc)
     return DOH_OUT_OF_MEM;
 
-  /* From here on, must free workstore.alloc on error */
+  /* From here on, must free c->alloc on error */
 
   /* /\* Copy early, as if good, while debugging parser *\/ */
   /* memcpy(c->alloc, src, rdlength); */
@@ -872,13 +872,13 @@ static DOHcode store_svcb_rdata(unsigned char *doh,
                  ); /* Parse TargetName */
 
   if(!rc) {
-    len -= (index - rdbase);     /* Adjust len to correspond to index */
+    len -= (index - rdbase);    /* Adjust len to correspond to index */
 
     /* TODO: resolve type-conversion here */
-    parmbase = rdlength - len;   /* Parameter list follows next */
+    parmbase = rdlength - len;  /* Parameter list follows next */
 
-    if((len && !priority) ||      /* Residual data in AliasForm */
-       (!len && priority))        /* Missing data in ServiceForm */
+    if((len && !priority) ||    /* Residual data in AliasForm */
+       (!len && priority))      /* Missing data in ServiceForm */
       rc = DOH_DNS_MALFORMAT;
 
     while(len) {
@@ -891,7 +891,8 @@ static DOHcode store_svcb_rdata(unsigned char *doh,
       }
 
       nextkey = get16bit(doh, index);
-      if(nextkey <= key && index > parmbase) { /* keys must be in order */
+      if(nextkey <= key &&      /* insist that keys are in order */
+         index > parmbase) {    /* but always allow the first one! */
         rc = DOH_DNS_MALFORMAT;
         break;
       }
@@ -1022,11 +1023,11 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
   unsigned char *expected = qry + 12;       /* QNAME */
 
   /* Add others as needed */
-  /* char *prefix = p->prefix; */
 
   if(dohlen < 12)
     return DOH_TOO_SMALL_BUFFER; /* too small */
 
+  /* TODO: decide how to deal with ID */
   /* if(!doh || doh[0] || doh[1]) */
   /*   return DOH_DNS_BAD_ID; /\* bad ID *\/ */
   if(!doh || doh[0] != qry[0] || doh[1] != qry[1])
@@ -1111,8 +1112,12 @@ static DOHcode doh_decode_in_context(struct dnsprobe *p,
       return rc; /* bad rdata */
 
     /* CNAME: update expected name from rdata */
-    if(type == DNS_TYPE_CNAME)
-      expected = d->cname[d->numcname].alloc;
+    if(type == DNS_TYPE_CNAME) {
+      if(d->numcname) {
+        unsigned int this = d->numcname - 1;
+        expected = d->cname[this].alloc;
+      }
+    }
 
     index += rdlength;
     ancount--;
@@ -1964,7 +1969,7 @@ static void showdoh(struct Curl_easy *data,
 
   infof(data, "DOH TTL: %u seconds\n", d->ttl);
 
-  infof(data, "DOH: IP addresses: %u\n", d->numaddr);
+  infof(data, "DOH IP addresses: %u\n", d->numaddr);
   for(i = 0; i < d->numaddr; i++) {
     char buffer[INET6_ADDRSTRLEN];
     struct dohaddr *a = &d->addr[i];
@@ -1978,7 +1983,7 @@ static void showdoh(struct Curl_easy *data,
     }
   }
 
-  infof(data, "DOH: CNAME references: %u\n", d->numcname);
+  infof(data, "DOH CNAME references: %u\n", d->numcname);
   for(i = 0; i < d->numcname; i++) {
     char buffer[255] = { '\0' };
     unsigned int index = 0;
@@ -2001,7 +2006,7 @@ static void showdoh(struct Curl_easy *data,
     infof(data, "DOH %5s: %s\n", "CNAME", buffer);
   }
 #ifdef USE_ESNI
-  infof(data, "DOH: Service bindings %u\n", d->num_svcb_data);
+  infof(data, "DOH Service bindings: %u\n", d->num_svcb_data);
   for(i = 0; i < d->num_svcb_data; i++) {
     unsigned char *buffer = d->svcb_data[i].alloc;
     size_t buflen = d->svcb_data[i].len;
@@ -2049,7 +2054,7 @@ static void showdoh(struct Curl_easy *data,
       }
     }
   }
-  infof(data, "DOH: ESNI configurations: %u\n",
+  infof(data, "DOH ESNI configurations: %u\n",
         d->num_esni_txt, (d->num_esni_txt == 1) ? "" : "s");
   for(i = 0; i < d->num_esni_txt; i++) {
     CURLcode rc;
@@ -2270,7 +2275,13 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
       Curl_close(&data->req.doh.probe[slot].easy);
     }
     /* parse the responses, create the struct and return it! */
+
     init_dohentry(&de);
+    /* TODO: make the dohentry persist somewhere to allow for
+     * following the SVCB alias chain; connectdata seems the right
+     * place
+     */
+
     for(slot = 0; slot < DOH_PROBE_SLOTS; slot++) {
       struct dnsprobe *p = &data->req.doh.probe[slot];
       prefix = p->prefix;
@@ -2279,31 +2290,15 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
 
       if(type) {
         uint16_t ancount = 0;
-
-        /* /\* Original decoder interface *\/ */
-        /* rc[slot] = doh_decode(p->serverdoh.memory, */
-        /*                       p->serverdoh.size, */
-        /*                       p->dnstype, */
-        /*                       &de); */
-
         /* New decoder interface */
         rc[slot] = doh_decode_in_context(p, &de, data);
-        if(rc[slot] != DOH_TOO_SMALL_BUFFER)
-          ancount = get16bit(p->serverdoh.memory, 6);
-
-        infof(data,
-              "DOH: slot %d (QTYPE %2d) decoded; rc: %d, ANCOUNT: %d\n",
-              slot, type, rc[slot], ancount);
       }
       else
         infof(data, "DOH: slot %d was not used\n", slot);
 
-      Curl_safefree(p->serverdoh.memory);
-      if(rc[slot] == DOH_DNS_NAME_MISMATCH) {
-        rc[slot] = DOH_OK;      /* TODO: when done testing, treat as error */
-      }
+      Curl_safefree(p->serverdoh.memory); /* Done with response: discard */
 
-      else if(rc[slot]) {
+      if(rc[slot]) {
         infof(data, "DOH: %s (rc: %d) type %s for %s%s%s\n",
               doh_strerror(rc[slot]),
               rc[slot],
@@ -2317,26 +2312,103 @@ CURLcode Curl_doh_is_resolved(struct connectdata *conn,
     infof(data, "DOH Host name: %s\n", data->req.doh.host);
     showdoh(data, &de);
 
-    /* /\* Check for incomplete SVCB Alias chain *\/ */
-    /* if(de.num_svcb_data) { */
-    /*   /\* We have SVCB data *\/ */
-    /*   int i; */
-    /*   uint16_t priority = 0; */
-    /*   infof(data, "DOH: checking %d SVCB entries\n", de.num_svcb_data); */
-    /*   for(i = 0; i < de.num_svcb_data; i++) { */
-    /*     priority = get16bit(de.svcb_data[i].alloc, 0); */
-    /*     if(priority)            /\* ServiceMode *\/ */
-    /*       break; */
-    /*   } */
-    /*   if(!priority) {           /\* Only AliasMode *\/ */
-    /*     infof(data, "DOH: incomplete SVCB AliasMode chain\n"); */
-    /*     return CURLE_COULDNT_RESOLVE_HOST; */
-    /*   } */
-    /* } */
-
     result = CURLE_COULDNT_RESOLVE_HOST; /* until we know better */
-    if(!rc[DOH_PROBE_SLOT_IPADDR_V4] || !rc[DOH_PROBE_SLOT_IPADDR_V6]) {
-      /* we have an address, of one kind or other */
+
+#ifdef USE_ESNI
+
+    /* Check for service binding data */
+    if(de.num_svcb_data) {
+      struct svcbstore *service, *alias, *this;
+      unsigned int prio;
+
+      this = de.svcb_data;
+      prio = get16bit(this->alloc, 0);
+      service = prio ? this : NULL;
+      alias = prio ? NULL : this;
+
+      for(this++; this < de.svcb_data + de.num_svcb_data; this++) {
+        unsigned int thisprio = get16bit(this->alloc, 0);
+        infof(data,
+              "     This SVCB data instance has priority %u\n", thisprio);
+        if(!thisprio) {
+          /* AliasMode:
+           * bias towards later one to take opportunistic advantage
+           * of any resolver-provided chain of aliases
+           */
+          /* TODO:
+           * check continuity of alias chain by matching
+           * owner-name of each RR against previous TargetName
+           *
+           * This means we'll need to store SVCB data as
+           * [ owner-name ][ TYPE (or not?) ][ RDATA ]
+           */
+          /* TODO:
+           * check for AliasMode "." and ALL of this TYPE of SVCB
+           */
+          alias = this;
+        }
+        else {
+          /* ServiceMode:
+           * bias toward earliest at lowest non-zero priority
+           */
+          if(!service || thisprio < prio) {
+            /* this is the preferren ServiceMode instance so far */
+            prio = thisprio;
+            service = this;
+          }
+        }
+      }
+
+      if(service) {
+        /* Here we expect ServiceMode data found either directly
+         * or by following an AliasMode chain
+         */
+        unsigned int offset;
+        infof(data,
+              "     Found eligible ServiceMode data: *p\n", service);
+        /* look for address parameters and propagate */
+        for(offset = service->index[DNS_SVCB_PARAM_IPV6HINT];
+            offset;) {
+          infof(data, "    Found IPv6 address hint(s)\n");
+          break;
+        }
+        for(offset = service->index[DNS_SVCB_PARAM_IPV4HINT];
+            offset;) {
+          infof(data, "    Found IPv4 address hint(s)\n");
+          break;
+        }
+      }
+      else if(alias) {
+        /* Here we have AliasMode data to be followed in a next pass */
+
+        char qname[256];
+        wire2name(qname, 255, alias->alloc + 2, alias->allocsize -2);
+
+        infof(data,
+              "    Found AliasMode data for following: %p\n"
+              "      size: %u\n"
+              "      name: %s\n"
+              , alias, alias->allocsize, qname);
+      }
+    }
+
+#endif
+
+    /* if(!rc[DOH_PROBE_SLOT_IPADDR_V4] || */
+    /*    !rc[DOH_PROBE_SLOT_IPADDR_V6]) { */
+    /*   /\* we have an address, of one kind or other *\/ */
+
+    /*   /\*  */
+    /*    *  Well, no. This is the wrong test. If either slot is unused */
+    /*    *  (eg. because CURL_IPRESOLVE_V4 is set), its rc will be */
+    /*    *  zero. If the result from the other slot is no good, we end */
+    /*    *  up with no address; when doh2ai is invoked further on below, */
+    /*    *  a NULL pointer is returned, causing an unhelpful message to */
+    /*    *  be presented: "curl: (27) Out of memory". */
+    /*    *\/ */
+
+    if(de.numaddr) {
+      /* we have at least one address, of one kind or other */
       struct Curl_dns_entry *dns;
       struct Curl_addrinfo *ai;
 #ifdef USE_ESNI

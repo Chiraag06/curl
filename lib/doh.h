@@ -146,7 +146,8 @@ struct dohaddr {
 
 struct dohentry {
   unsigned int ttl;
-  int numaddr;
+  unsigned int follow;
+  int numaddr;              /* TODO: check why this and others not unsigned */
   char *prefix;             /* UGLY hack: end-run around doh_decode */
   struct dohaddr addr[DOH_MAX_ADDR];
   int numcname;
